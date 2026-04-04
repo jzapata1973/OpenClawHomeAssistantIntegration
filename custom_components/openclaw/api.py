@@ -104,6 +104,11 @@ class OpenClawApiClient:
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create an aiohttp session."""
         if self._session is None or self._session.closed:
+            if self._session is not None and self._session.closed:
+                _LOGGER.warning(
+                    "Primary aiohttp session unavailable — creating fallback session. "
+                    "This may bypass HA connection management"
+                )
             self._session = aiohttp.ClientSession()
         return self._session
 

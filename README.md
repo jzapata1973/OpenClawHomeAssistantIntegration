@@ -28,6 +28,7 @@ OpenClaw is a Home Assistant custom integration that connects your HA instance t
   - `openclaw.send_message`
   - `openclaw.clear_history`
   - `openclaw.invoke_tool`
+- **Integration options** for model selection and voice-specific routing
 - **Event**
   - `openclaw_message_received`
   - `openclaw_tool_invoked`
@@ -192,6 +193,13 @@ When enabled, OpenClaw tool-call responses can execute Home Assistant services.
 - **Wake word enabled**
 - **Wake word** (default: `hey openclaw`)
 - **Voice input provider** (`browser` or `assist_stt`)
+- **Voice agent ID** (optional)
+
+### Model selection
+
+- **Active Model** select entity controls the model override used for chat-card and Assist requests.
+- If no model is selected, the gateway default is used.
+- Assist conversation IDs are conservatively namespaced by agent ID so different agents do not accidentally share the same conversation context.
 
 ### Voice provider usage
 
@@ -227,11 +235,13 @@ If voice is unreliable in Brave, use Chrome/Edge for card voice input or continu
 
 Send a message to OpenClaw.
 
+> Note: file attachments are not currently supported by this service. The old `attachments` field was removed because it was accepted by the schema but never sent to the gateway.
+
 Fields:
 
 - `message` (required)
 - `session_id` (optional)
-- `attachments` (optional)
+- `agent_id` (optional)
 
 Example:
 
@@ -312,6 +322,8 @@ action:
 ### `openclaw_tool_invoked`
 
 Fired when `openclaw.invoke_tool` completes.
+
+The integration also exposes native Event entities for both message-received and tool-invoked events so they can be selected directly in the automation UI.
 
 Event data includes:
 

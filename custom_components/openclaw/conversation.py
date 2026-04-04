@@ -24,11 +24,13 @@ from .const import (
     ATTR_SESSION_ID,
     ATTR_TIMESTAMP,
     CONF_ASSIST_SESSION_ID,
+    CONF_AGENT_ID,
     CONF_CONTEXT_MAX_CHARS,
     CONF_CONTEXT_STRATEGY,
     CONF_INCLUDE_EXPOSED_CONTEXT,
     CONF_VOICE_AGENT_ID,
     DEFAULT_ASSIST_SESSION_ID,
+    DEFAULT_AGENT_ID,
     DEFAULT_CONTEXT_MAX_CHARS,
     DEFAULT_CONTEXT_STRATEGY,
     DEFAULT_INCLUDE_EXPOSED_CONTEXT,
@@ -38,6 +40,7 @@ from .const import (
 )
 from .coordinator import OpenClawCoordinator
 from .exposure import apply_context_policy, build_exposed_entities_context
+from .helpers import extract_text_recursive
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -117,12 +120,20 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
         coordinator: OpenClawCoordinator = entry_data["coordinator"]
 
         message = user_input.text
-        conversation_id = self._resolve_conversation_id(user_input)
         assistant_id = "conversation"
         options = self.entry.options
         voice_agent_id = self._normalize_optional_text(
             options.get(CONF_VOICE_AGENT_ID)
         )
+        configured_agent_id = self._normalize_optional_text(
+            options.get(
+                CONF_AGENT_ID,
+                self.entry.data.get(CONF_AGENT_ID, DEFAULT_AGENT_ID),
+            )
+        )
+        resolved_agent_id = voice_agent_id or configured_agent_id
+        conversation_id = self._resolve_conversation_id(user_input, resolved_agent_id)
+        active_model = self._normalize_optional_text(options.get("active_model"))
         include_context = options.get(
             CONF_INCLUDE_EXPOSED_CONTEXT,
             DEFAULT_INCLUDE_EXPOSED_CONTEXT,
@@ -149,8 +160,9 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
                 client,
                 message,
                 conversation_id,
-                voice_agent_id,
+                resolved_agent_id,
                 system_prompt,
+                active_model,
             )
         except OpenClawApiError as err:
             _LOGGER.error("OpenClaw conversation error: %s", err)
@@ -165,8 +177,9 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
                             client,
                             message,
                             conversation_id,
-                            voice_agent_id,
+                            resolved_agent_id,
                             system_prompt,
+                            active_model,
                         )
                     except OpenClawApiError as retry_err:
                         return self._error_result(
@@ -205,8 +218,12 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
             continue_conversation=self._should_continue(full_response),
         )
 
-    def _resolve_conversation_id(self, user_input: conversation.ConversationInput) -> str:
-        """Return conversation id from HA or a stable Assist fallback session key."""
+    def _resolve_conversation_id(
+        self,
+        user_input: conversation.ConversationInput,
+        agent_id: str | None,
+    ) -> str:
+        """Return conversation id from HA with conservative agent namespacing."""
         configured_session_id = self._normalize_optional_text(
             self.entry.options.get(
                 CONF_ASSIST_SESSION_ID,
@@ -216,19 +233,25 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
         if configured_session_id:
             return configured_session_id
 
+        agent_suffix = self._normalize_optional_text(agent_id)
+
         if user_input.conversation_id:
+            if agent_suffix:
+                return f"{user_input.conversation_id}:{agent_suffix}"
             return user_input.conversation_id
 
         context = getattr(user_input, "context", None)
         user_id = getattr(context, "user_id", None)
         if user_id:
-            return f"assist_user_{user_id}"
+            base_id = f"assist_user_{user_id}"
+            return f"{base_id}:{agent_suffix}" if agent_suffix else base_id
 
         device_id = getattr(user_input, "device_id", None)
         if device_id:
-            return f"assist_device_{device_id}"
+            base_id = f"assist_device_{device_id}"
+            return f"{base_id}:{agent_suffix}" if agent_suffix else base_id
 
-        return "assist_default"
+        return f"assist_default:{agent_suffix}" if agent_suffix else "assist_default"
 
     def _normalize_optional_text(self, value: Any) -> str | None:
         """Return a stripped string or None for blank values."""
@@ -244,13 +267,14 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
         conversation_id: str,
         agent_id: str | None = None,
         system_prompt: str | None = None,
+        model: str | None = None,
     ) -> str:
         """Get a response from OpenClaw, trying streaming first."""
-        # Try streaming (lower TTFB for voice pipeline)
         full_response = ""
         async for chunk in client.async_stream_message(
             message=message,
             session_id=conversation_id,
+            model=model,
             system_prompt=system_prompt,
             agent_id=agent_id,
             extra_headers=_VOICE_REQUEST_HEADERS,
@@ -260,62 +284,15 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
         if full_response:
             return full_response
 
-        # Fallback to non-streaming
         response = await client.async_send_message(
             message=message,
             session_id=conversation_id,
+            model=model,
             system_prompt=system_prompt,
             agent_id=agent_id,
             extra_headers=_VOICE_REQUEST_HEADERS,
         )
-        extracted = self._extract_text_recursive(response)
-        return extracted or ""
-
-    def _extract_text_recursive(self, value: Any, depth: int = 0) -> str | None:
-        """Recursively extract assistant text from nested response payloads."""
-        if depth > 8:
-            return None
-
-        if isinstance(value, str):
-            text = value.strip()
-            return text or None
-
-        if isinstance(value, list):
-            parts: list[str] = []
-            for item in value:
-                extracted = self._extract_text_recursive(item, depth + 1)
-                if extracted:
-                    parts.append(extracted)
-            if parts:
-                return "\n".join(parts)
-            return None
-
-        if isinstance(value, dict):
-            priority_keys = (
-                "output_text",
-                "text",
-                "content",
-                "message",
-                "response",
-                "answer",
-                "choices",
-                "output",
-                "delta",
-            )
-
-            for key in priority_keys:
-                if key not in value:
-                    continue
-                extracted = self._extract_text_recursive(value.get(key), depth + 1)
-                if extracted:
-                    return extracted
-
-            for nested_value in value.values():
-                extracted = self._extract_text_recursive(nested_value, depth + 1)
-                if extracted:
-                    return extracted
-
-        return None
+        return extract_text_recursive(response) or ""
 
     @staticmethod
     def _should_continue(response: str) -> bool:
