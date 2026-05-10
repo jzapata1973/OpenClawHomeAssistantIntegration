@@ -201,16 +201,19 @@ class OpenClawApiClient:
         stream: bool = False,
         agent_id: str | None = None,
         extra_headers: dict[str, str] | None = None,
+        history: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Send a chat message (non-streaming).
 
         Args:
             message: The user message text.
-            session_id: Optional session/conversation ID.
+            session_id: Optional session/conversation ID (no-op since v1.0.2 — see notes below).
             model: Optional model override.
             stream: If True, raises ValueError (use async_stream_message).
             agent_id: Optional per-call agent ID override.
             extra_headers: Optional additional headers for gateway-side routing or hints.
+            history: Optional prior conversation turns to inject between system
+                prompt and current user message (v1.0.3, OpenAI-style continuity).
 
         Returns:
             Complete chat completion response.
@@ -221,6 +224,8 @@ class OpenClawApiClient:
         messages: list[dict[str, str]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
+        if history:
+            messages.extend(history)
         messages.append({"role": "user", "content": message})
 
         payload: dict[str, Any] = {
@@ -282,6 +287,7 @@ class OpenClawApiClient:
         system_prompt: str | None = None,
         agent_id: str | None = None,
         extra_headers: dict[str, str] | None = None,
+        history: list[dict[str, str]] | None = None,
     ) -> AsyncIterator[str]:
         """Send a chat message and stream the response via SSE.
 
@@ -289,10 +295,12 @@ class OpenClawApiClient:
 
         Args:
             message: The user message text.
-            session_id: Optional session/conversation ID.
+            session_id: Optional session/conversation ID (no-op since v1.0.2).
             model: Optional model override.
             agent_id: Optional per-call agent ID override.
             extra_headers: Optional additional headers for gateway-side routing or hints.
+            history: Optional prior conversation turns to inject between system
+                prompt and current user message (v1.0.3, OpenAI-style continuity).
 
         Yields:
             Content delta strings from the streaming response.
@@ -300,6 +308,8 @@ class OpenClawApiClient:
         messages: list[dict[str, str]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
+        if history:
+            messages.extend(history)
         messages.append({"role": "user", "content": message})
 
         payload: dict[str, Any] = {

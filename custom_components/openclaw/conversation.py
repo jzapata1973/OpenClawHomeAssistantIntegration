@@ -6,6 +6,7 @@ with Assist, Voice PE, and any HA voice satellite.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
 import re
@@ -50,6 +51,28 @@ _VOICE_REQUEST_HEADERS = {
     "x-openclaw-message-channel": "voice",
 }
 
+# v1.0.3: client-side message history per HA conversation_id.
+# The OpenClaw gateway forces routing to its default agent whenever ANY
+# session_id reference is present in the request — see CHANGELOG v1.0.2.
+# So we cannot rely on gateway-side session memory for continuity. Instead
+# we keep history in HA process memory and ship it as `messages[]` on each
+# request, OpenAI-style. This also lets us skip the (heavy) entities
+# system prompt on follow-up turns to save tokens.
+HISTORY_MAX_TURNS = 20            # last 20 user+assistant pairs (40 messages)
+SYSTEM_REFRESH_EVERY = 10         # re-inject system prompt every N turns
+MAX_CACHED_CONVERSATIONS = 50     # LRU eviction threshold
+
+
+@dataclass
+class _ConversationState:
+    """Per-conversation_id rolling state held in process memory."""
+
+    messages: list[dict[str, str]] = field(default_factory=list)
+    turns_since_system: int = 0
+    last_accessed: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -81,6 +104,8 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
         """Initialize the conversation agent."""
         self.hass = hass
         self.entry = entry
+        # v1.0.3: in-memory chat history per HA conversation_id
+        self._conversations: dict[str, _ConversationState] = {}
 
     @property
     def attribution(self) -> dict[str, str]:
@@ -162,19 +187,36 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
         max_chars = int(options.get(CONF_CONTEXT_MAX_CHARS, DEFAULT_CONTEXT_MAX_CHARS))
         strategy = options.get(CONF_CONTEXT_STRATEGY, DEFAULT_CONTEXT_STRATEGY)
 
-        raw_context = (
-            build_exposed_entities_context(
-                self.hass,
-                assistant=assistant_id,
-            )
-            if include_context
-            else None
+        # v1.0.3: cache lookup / create. The user's "Assist Session ID" override
+        # makes all Assist conversations share the same conversation_id, so this
+        # cache effectively gives a single rolling context until HA restart.
+        state = self._get_or_create_state(conversation_id)
+
+        # Decide whether to inject the (heavy) entities system prompt this turn.
+        # Skipping it on follow-ups is the main token-saver of v1.0.3.
+        should_inject_system = (
+            not state.messages
+            or state.turns_since_system >= SYSTEM_REFRESH_EVERY
         )
-        exposed_context = apply_context_policy(raw_context, max_chars, strategy)
-        extra_system_prompt = getattr(user_input, "extra_system_prompt", None)
-        system_prompt = "\n\n".join(
-            part for part in (exposed_context, extra_system_prompt) if part
-        ) or None
+
+        system_prompt: str | None = None
+        if should_inject_system:
+            raw_context = (
+                build_exposed_entities_context(
+                    self.hass,
+                    assistant=assistant_id,
+                )
+                if include_context
+                else None
+            )
+            exposed_context = apply_context_policy(raw_context, max_chars, strategy)
+            extra_system_prompt = getattr(user_input, "extra_system_prompt", None)
+            system_prompt = "\n\n".join(
+                part for part in (exposed_context, extra_system_prompt) if part
+            ) or None
+
+        # History to ship with this request (excludes any stored system messages).
+        history_to_send = [m for m in state.messages if m["role"] != "system"]
 
         try:
             full_response = await self._get_response(
@@ -184,6 +226,7 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
                 resolved_agent_id,
                 system_prompt,
                 active_model,
+                history_to_send,
             )
         except OpenClawApiError as err:
             _LOGGER.error("OpenClaw conversation error: %s", err)
@@ -201,6 +244,7 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
                             resolved_agent_id,
                             system_prompt,
                             active_model,
+                            history_to_send,
                         )
                     except OpenClawApiError as retry_err:
                         return self._error_result(
@@ -229,6 +273,9 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
             },
         )
         coordinator.update_last_activity()
+
+        # v1.0.3: persist this turn into the rolling history
+        self._record_turn(state, message, full_response, system_prompt is not None)
 
         intent_response = intent.IntentResponse(language=user_input.language)
         intent_response.async_set_speech(full_response)
@@ -289,6 +336,7 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
         agent_id: str | None = None,
         system_prompt: str | None = None,
         model: str | None = None,
+        history: list[dict[str, str]] | None = None,
     ) -> str:
         """Get a response from OpenClaw, trying streaming first."""
         full_response = ""
@@ -299,6 +347,7 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
             system_prompt=system_prompt,
             agent_id=agent_id,
             extra_headers=_VOICE_REQUEST_HEADERS,
+            history=history,
         ):
             full_response += chunk
 
@@ -312,8 +361,54 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
             system_prompt=system_prompt,
             agent_id=agent_id,
             extra_headers=_VOICE_REQUEST_HEADERS,
+            history=history,
         )
         return extract_text_recursive(response) or ""
+
+    # ── v1.0.3 history cache helpers ──────────────────────────────────────
+
+    def _get_or_create_state(self, conversation_id: str) -> _ConversationState:
+        """Return the rolling state for ``conversation_id``, creating if absent.
+
+        Touches ``last_accessed`` for LRU. Evicts the least-recently-used
+        conversation if the cache exceeds ``MAX_CACHED_CONVERSATIONS``.
+        """
+        state = self._conversations.get(conversation_id)
+        if state is None:
+            state = _ConversationState()
+            self._conversations[conversation_id] = state
+            if len(self._conversations) > MAX_CACHED_CONVERSATIONS:
+                oldest_key = min(
+                    self._conversations,
+                    key=lambda k: self._conversations[k].last_accessed,
+                )
+                self._conversations.pop(oldest_key, None)
+                _LOGGER.debug(
+                    "Evicted oldest conversation %r from cache (LRU)",
+                    oldest_key,
+                )
+        state.last_accessed = datetime.now(timezone.utc)
+        return state
+
+    def _record_turn(
+        self,
+        state: _ConversationState,
+        user_message: str,
+        assistant_message: str,
+        system_prompt_was_sent: bool,
+    ) -> None:
+        """Append the just-completed turn into the rolling history and trim."""
+        state.messages.append({"role": "user", "content": user_message})
+        state.messages.append({"role": "assistant", "content": assistant_message})
+        if system_prompt_was_sent:
+            state.turns_since_system = 1
+        else:
+            state.turns_since_system += 1
+
+        # Trim to the last HISTORY_MAX_TURNS turns (= 2 * messages each)
+        max_msgs = HISTORY_MAX_TURNS * 2
+        if len(state.messages) > max_msgs:
+            state.messages = state.messages[-max_msgs:]
 
     @staticmethod
     def _should_continue(response: str) -> bool:
