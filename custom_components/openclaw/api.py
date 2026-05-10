@@ -242,6 +242,15 @@ class OpenClawApiClient:
         session = await self._get_session()
         url = f"{self._base_url}{API_CHAT_COMPLETIONS}"
 
+        _LOGGER.warning(
+            "OpenClaw POST (non-stream) | url=%s | payload.model=%r | "
+            "payload keys=%s | header agent=%r",
+            url,
+            payload.get("model"),
+            list(payload.keys()),
+            headers.get("x-openclaw-agent-id"),
+        )
+
         try:
             async with session.post(
                 url,
@@ -307,6 +316,15 @@ class OpenClawApiClient:
 
         session = await self._get_session()
         url = f"{self._base_url}{API_CHAT_COMPLETIONS}"
+
+        _LOGGER.warning(
+            "OpenClaw POST (stream) | url=%s | payload.model=%r | "
+            "payload keys=%s | header agent=%r",
+            url,
+            payload.get("model"),
+            list(payload.keys()),
+            headers.get("x-openclaw-agent-id"),
+        )
 
         try:
             async with session.post(

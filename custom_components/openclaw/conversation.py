@@ -140,8 +140,21 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
         # When no explicit model is selected via the active_model entity,
         # derive `openclaw/<agent_id>` so the configured agent actually
         # receives the request instead of the gateway default ("main").
+        raw_active_model = options.get("active_model")
         if not active_model and resolved_agent_id and resolved_agent_id != DEFAULT_AGENT_ID:
             active_model = f"openclaw/{resolved_agent_id}"
+
+        _LOGGER.warning(
+            "OpenClaw routing diagnostic | options.active_model=%r | "
+            "voice_agent_id=%r | configured_agent_id=%r | resolved_agent_id=%r | "
+            "final model sent=%r | conversation_id=%r",
+            raw_active_model,
+            voice_agent_id,
+            configured_agent_id,
+            resolved_agent_id,
+            active_model,
+            conversation_id,
+        )
         include_context = options.get(
             CONF_INCLUDE_EXPOSED_CONTEXT,
             DEFAULT_INCLUDE_EXPOSED_CONTEXT,
