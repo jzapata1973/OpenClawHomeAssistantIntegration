@@ -69,24 +69,40 @@ class OpenClawModelSelect(CoordinatorEntity[OpenClawCoordinator], SelectEntity):
             "manufacturer": "OpenClaw",
             "model": "OpenClaw Gateway",
         }
-        # Initialise from coordinator cache
+        # Initialise from coordinator cache, preferring user's persisted choice.
+        # The user's selection in entry.options is the source of truth and must
+        # not be overridden by the gateway-reported default model.
+        # See upstream issues #8, #24, #28.
         models = coordinator.available_models
         self._attr_options = models if models else ["unknown"]
-        current = (coordinator.data or {}).get(DATA_MODEL)
-        self._attr_current_option = current if current in self._attr_options else (
-            self._attr_options[0] if self._attr_options else None
+        self._attr_current_option = self._resolve_current_option(
+            entry.options.get("active_model"),
+            (coordinator.data or {}).get(DATA_MODEL),
         )
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Update options and current selection when coordinator refreshes."""
+        """Update options when coordinator refreshes; preserve user's choice."""
         models = self.coordinator.available_models
         if models:
             self._attr_options = models
-        current = (self.coordinator.data or {}).get(DATA_MODEL)
-        if current and current in self._attr_options:
-            self._attr_current_option = current
+        self._attr_current_option = self._resolve_current_option(
+            self._entry.options.get("active_model"),
+            (self.coordinator.data or {}).get(DATA_MODEL),
+        )
         self.async_write_ha_state()
+
+    def _resolve_current_option(
+        self,
+        user_selection: str | None,
+        gateway_default: str | None,
+    ) -> str | None:
+        """Pick the option to display: user choice wins over gateway default."""
+        if user_selection and user_selection in self._attr_options:
+            return user_selection
+        if gateway_default and gateway_default in self._attr_options:
+            return gateway_default
+        return self._attr_options[0] if self._attr_options else None
 
     async def async_select_option(self, option: str) -> None:
         """Handle the user selecting a new model.

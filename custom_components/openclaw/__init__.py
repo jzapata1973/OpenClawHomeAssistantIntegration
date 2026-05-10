@@ -421,12 +421,21 @@ def _async_register_services(hass: HomeAssistant) -> None:
         client: OpenClawApiClient = entry_data["client"]
         coordinator: OpenClawCoordinator = entry_data["coordinator"]
         options = _get_entry_options(hass, entry_data)
+        entry: ConfigEntry | None = entry_data.get("entry")
         voice_agent_id = _normalize_optional_text(
             options.get(CONF_VOICE_AGENT_ID, DEFAULT_VOICE_AGENT_ID)
+        )
+        configured_agent_id = _normalize_optional_text(
+            options.get(
+                CONF_AGENT_ID,
+                (entry.data.get(CONF_AGENT_ID, DEFAULT_AGENT_ID) if entry else DEFAULT_AGENT_ID),
+            )
         )
         resolved_agent_id = call_agent_id
         if resolved_agent_id is None and source == "voice":
             resolved_agent_id = voice_agent_id
+        if resolved_agent_id is None:
+            resolved_agent_id = configured_agent_id
 
         try:
             include_context = options.get(
@@ -448,6 +457,17 @@ def _async_register_services(hass: HomeAssistant) -> None:
             system_prompt = apply_context_policy(raw_context, max_chars, strategy)
 
             active_model = _normalize_optional_text(options.get("active_model"))
+
+            # Upstream issues #8, #24, #28: gateway routes by `model` payload
+            # field, not by the `x-openclaw-agent-id` header. When no explicit
+            # active_model is set, derive `openclaw/<agent_id>` so the
+            # configured agent receives the request instead of the default.
+            if (
+                not active_model
+                and resolved_agent_id
+                and resolved_agent_id != DEFAULT_AGENT_ID
+            ):
+                active_model = f"openclaw/{resolved_agent_id}"
 
             _append_chat_history(hass, session_id, "user", message)
 
