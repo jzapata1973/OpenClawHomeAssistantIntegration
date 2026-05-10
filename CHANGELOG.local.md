@@ -6,6 +6,37 @@ Cambios aplicados sobre el fork `jzapata1973/OpenClawHomeAssistantIntegration` q
 
 ---
 
+## [1.0.2] · 2026-05-10 — Fix definitivo de routing al agente
+
+### Síntoma residual de v1.0.0/v1.0.1
+
+A pesar de mandar `model=openclaw/<agente>` correcto en el payload, el gateway igual ruteaba al agente default (`main`). Confirmado vía curl directo:
+
+| `session_id` mandado en | Routing efectivo |
+|---|---|
+| Nada | Agente correcto ✅ |
+| Payload (`session_id`+`user`) | `main` ❌ |
+| Headers (`X-Session-Id`, `x-openclaw-session-key`) | `main` ❌ |
+| Ambos | `main` ❌ |
+
+Y peor: el gateway responde con `"model": "<el que pediste>"` aunque internamente usó otro agente. La response miente.
+
+### Fix
+
+`custom_components/openclaw/api.py` — ya **NO se manda `session_id`/`user` en el payload** ni `X-Session-Id`/`x-openclaw-session-key` en headers. Solo va `model`, `messages` y `stream`. Esto restaura el routing por modelo.
+
+### Tradeoff conocido
+
+Se pierde la **continuidad de sesión cross-invocation en OpenClaw** (cada vez que abrís Assist y mandás algo, OpenClaw crea una sesión nueva). HA mantiene su `conversation_id` interno y sigue mandando `messages[]` con el historial dentro de la misma "ronda" de Assist, así que los follow-ups siguen teniendo contexto.
+
+Si en el futuro queremos recuperar continuidad real en OpenClaw, hay que investigar si el gateway acepta session_ids prefijados con el agente (ej. `nabu-home:mi-sesion`) o si hay endpoint para crear sesión bajo agente específico.
+
+### Cleanup
+
+Logs `WARNING` de v1.0.1 bajados a `DEBUG` (ya no spamean en cada chat).
+
+---
+
 ## [1.0.1] · 2026-05-10 — Diagnóstico: logs de routing
 
 Logs `WARNING` temporales en `conversation.py` y `api.py` para diagnosticar por qué v1.0.0 no logra rutear las requests al agente correcto en algunos setups, a pesar de que el curl directo al gateway con `model=openclaw/<agent>` funciona perfecto.

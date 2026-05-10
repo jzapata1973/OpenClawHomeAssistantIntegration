@@ -144,8 +144,8 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
         if not active_model and resolved_agent_id and resolved_agent_id != DEFAULT_AGENT_ID:
             active_model = f"openclaw/{resolved_agent_id}"
 
-        _LOGGER.warning(
-            "OpenClaw routing diagnostic | options.active_model=%r | "
+        _LOGGER.debug(
+            "OpenClaw routing | options.active_model=%r | "
             "voice_agent_id=%r | configured_agent_id=%r | resolved_agent_id=%r | "
             "final model sent=%r | conversation_id=%r",
             raw_active_model,
