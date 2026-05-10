@@ -6,6 +6,52 @@ Cambios aplicados sobre el fork `jzapata1973/OpenClawHomeAssistantIntegration` q
 
 ---
 
+## [1.0.3] · 2026-05-10 — Continuidad de conversación client-side + token saving
+
+### Contexto
+
+v1.0.2 dejó las requests de HA ruteando al agente correcto (nabu-home), pero como se sacó `session_id` del payload (porque cualquier referencia rompía el routing), **cada mensaje de Assist creaba una sesión nueva en el gateway**. Y el system prompt con todas las entidades (~13.000 chars) se mandaba en CADA request, inflando el costo.
+
+Probamos varias formas de coaxar al gateway desde el cliente para tener una sesión persistente bajo nabu-home (`openai:` prefix, `agent:` prefix, headers solos, etc.) — todas terminaron creando sesión bajo el agente default. **El gateway no se puede convencer desde el cliente.**
+
+### Solución
+
+**Continuidad client-side, estilo OpenAI estándar:** HA mantiene el historial de cada conversación en memoria de proceso y lo manda en `messages[]` en cada request. El gateway sigue siendo stateless desde la perspectiva del routing → routing por `model` sigue funcionando.
+
+**Skip del system prompt en follow-ups** — el contexto pesado (entidades expuestas) solo se inyecta:
+- En la primera request de cada conversación (cuando el cache de historial está vacío)
+- Cada `SYSTEM_REFRESH_EVERY = 10` turnos (para refrescar estados de entidades)
+
+### Defaults (hardcoded en `conversation.py`)
+
+```python
+HISTORY_MAX_TURNS         = 20    # ventana de últimos 20 pares user+assistant
+SYSTEM_REFRESH_EVERY      = 10    # re-inyectar system prompt cada 10 turnos
+MAX_CACHED_CONVERSATIONS  = 50    # LRU eviction después de 50 conversaciones simultáneas
+```
+
+### Archivos tocados
+
+- `conversation.py` — agrega `_ConversationState` dataclass, cache `self._conversations`, helpers `_get_or_create_state` y `_record_turn`. Reescribe la lógica de `async_process` para decidir cuándo mandar system prompt y construir el historial.
+- `api.py` — `async_send_message` y `async_stream_message` aceptan param opcional `history: list[dict] | None` que se inyecta entre system prompt y user message.
+
+### Tradeoffs
+
+- ✅ Continuidad de conversación entre invocaciones de Assist (el `Assist Session ID` override hace que todas compartan el mismo conversation_id internamente → mismo cache)
+- ✅ Token saving fuerte: turnos 2-10 son ~13.000 chars más livianos cada uno
+- ✅ Routing por modelo intacto (no se rompió v1.0.2)
+- ❌ Historial se pierde con cada reinicio de HA (es in-memory)
+- ❌ Cada request sigue creando una sesión `openai:UUID` en el gateway, pero ahora bajo el agente correcto y con poca data
+- ❌ Los estados de entidades solo se refrescan cada 10 turnos (si cambia algo importante en HA durante una conversación larga, el agente puede no verlo hasta el refresh)
+
+### Para futuras versiones
+
+- Persistir historial a disco para sobrevivir reinicios de HA (v1.1.0 candidato)
+- Hacer los 3 defaults configurables via Options Flow
+- Refrescar system prompt cuando detecte cambio en entidades expuestas (event-driven)
+
+---
+
 ## [1.0.2] · 2026-05-10 — Fix definitivo de routing al agente
 
 ### Síntoma residual de v1.0.0/v1.0.1
