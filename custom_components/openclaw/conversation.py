@@ -134,6 +134,14 @@ class OpenClawConversationAgent(conversation.AbstractConversationAgent):
         resolved_agent_id = voice_agent_id or configured_agent_id
         conversation_id = self._resolve_conversation_id(user_input, resolved_agent_id)
         active_model = self._normalize_optional_text(options.get("active_model"))
+
+        # Upstream issues #8, #24, #28: the gateway routes by `model` in the
+        # OpenAI-compatible payload, not by the `x-openclaw-agent-id` header.
+        # When no explicit model is selected via the active_model entity,
+        # derive `openclaw/<agent_id>` so the configured agent actually
+        # receives the request instead of the gateway default ("main").
+        if not active_model and resolved_agent_id and resolved_agent_id != DEFAULT_AGENT_ID:
+            active_model = f"openclaw/{resolved_agent_id}"
         include_context = options.get(
             CONF_INCLUDE_EXPOSED_CONTEXT,
             DEFAULT_INCLUDE_EXPOSED_CONTEXT,
