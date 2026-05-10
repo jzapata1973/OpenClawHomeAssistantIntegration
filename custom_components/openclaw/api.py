@@ -227,22 +227,25 @@ class OpenClawApiClient:
             "messages": messages,
             "stream": False,
         }
-        if session_id:
-            payload["session_id"] = session_id
-            payload["user"] = session_id
         if model:
             payload["model"] = model
 
-        # Pass session_id as a custom header or param if supported by gateway
+        # NOTE (v1.0.2): session_id is NOT forwarded to the gateway because
+        # the gateway, when it sees any session reference (in payload OR in
+        # headers), creates a new session under its default agent (`main`)
+        # ignoring the `model` field — and worse, returns `model=<requested>`
+        # in the response while actually using the wrong agent. To preserve
+        # model-based agent routing we drop session_id entirely. HA's own
+        # conversation_id continuity (within an Assist invocation) still
+        # works via the `messages[]` history that we keep sending.
+        # Tradeoff: cross-invocation session continuity in OpenClaw is lost.
+        # See diagnostic notes for v1.0.2 in CHANGELOG.local.md.
         headers = self._headers(agent_id=agent_id, extra_headers=extra_headers)
-        if session_id:
-            headers["X-Session-Id"] = session_id
-            headers["x-openclaw-session-key"] = session_id
 
         session = await self._get_session()
         url = f"{self._base_url}{API_CHAT_COMPLETIONS}"
 
-        _LOGGER.warning(
+        _LOGGER.debug(
             "OpenClaw POST (non-stream) | url=%s | payload.model=%r | "
             "payload keys=%s | header agent=%r",
             url,
@@ -303,21 +306,17 @@ class OpenClawApiClient:
             "messages": messages,
             "stream": True,
         }
-        if session_id:
-            payload["session_id"] = session_id
-            payload["user"] = session_id
         if model:
             payload["model"] = model
 
+        # NOTE (v1.0.2): session_id intentionally NOT forwarded — see the
+        # explanation in async_send_message above.
         headers = self._headers(agent_id=agent_id, extra_headers=extra_headers)
-        if session_id:
-            headers["X-Session-Id"] = session_id
-            headers["x-openclaw-session-key"] = session_id
 
         session = await self._get_session()
         url = f"{self._base_url}{API_CHAT_COMPLETIONS}"
 
-        _LOGGER.warning(
+        _LOGGER.debug(
             "OpenClaw POST (stream) | url=%s | payload.model=%r | "
             "payload keys=%s | header agent=%r",
             url,
