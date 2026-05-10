@@ -6,6 +6,20 @@ Cambios aplicados sobre el fork `jzapata1973/OpenClawHomeAssistantIntegration` q
 
 ---
 
+## [1.0.1] · 2026-05-10 — Diagnóstico: logs de routing
+
+Logs `WARNING` temporales en `conversation.py` y `api.py` para diagnosticar por qué v1.0.0 no logra rutear las requests al agente correcto en algunos setups, a pesar de que el curl directo al gateway con `model=openclaw/<agent>` funciona perfecto.
+
+Loguea:
+- `options.active_model` (lo que el select tiene persistido)
+- `voice_agent_id`, `configured_agent_id`, `resolved_agent_id`
+- `model` final que llega al payload
+- `payload.model` y `payload keys` justo antes del POST al gateway
+
+Una vez identificada la causa, los logs vuelven a `DEBUG` o se eliminan en una versión posterior.
+
+---
+
 ## [1.0.0] · 2026-05-10 — Fix: routing real al agente configurado
 
 **Resuelve los upstream issues:** [#8](https://github.com/techartdev/OpenClawHomeAssistantIntegration/issues/8), [#24](https://github.com/techartdev/OpenClawHomeAssistantIntegration/issues/24), [#28](https://github.com/techartdev/OpenClawHomeAssistantIntegration/issues/28).
