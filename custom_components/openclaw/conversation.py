@@ -172,10 +172,11 @@ class OpenClawConversationEntity(
             "Tenés tools nativas de Home Assistant (HassTurnOn, "
             "HassClimateSetTemperature, etc.) para leer estados y accionar "
             "dispositivos — usá esas tools, NUNCA improvises HTTP requests. "
-            "Después de ejecutar una tool, SIEMPRE cerrá con un mensaje "
+            "Después de ejecutar una tool, SIEMPRE cerrá con una frase "
             "breve en el idioma del usuario describiendo qué pasó (ej. "
             '"Listo, encendí 5 luces" o "La temperatura es 23°C"). '
-            "Nunca respondas solamente con 'NO', 'OK' o 'YES' sueltos."
+            "Nunca respondas solamente con 'NO', 'OK', 'YES', 'NO_REPLY' "
+            "u otros tokens internos cortos — siempre una oración descriptiva."
         )
 
     # ── core message handler ─────────────────────────────────────────
@@ -335,11 +336,31 @@ class OpenClawConversationEntity(
                     "de iteraciones de tools."
                 )
 
-        # Compose the final reply for HA Assist. Deduplicate adjacent
-        # repeats (some Qwen runs emit the same announcement twice across
-        # iterations) and drop trivial one-word responses if there's a
-        # better piece available — Qwen occasionally answers a final "NO"
-        # alone after correctly summarising in a prior iteration.
+        # Compose the final reply for HA Assist.
+        #
+        # Qwen3 occasionally emits internal control tokens like `NO_REPLY`
+        # (its "done, nothing to say" signal) or one-word filler ("NO",
+        # "OK", "YES") at the END of a tool-call cycle. Those tokens leak
+        # into output_text and, when shipped to HA Assist as the agent's
+        # reply, get rendered as "No response from OpenClaw" — even when
+        # the action actually succeeded and a useful prior piece exists.
+        # See CHANGELOG v2.1.3.
+        #
+        # Strategy: dedupe adjacent repeats, then drop any piece that is
+        # *only* a trivial/control token (case-insensitive, ignoring
+        # surrounding punctuation/underscore/space). If filtering empties
+        # the response, fall back to "Listo." rather than handing HA an
+        # empty speech.
+        _TRIVIAL_TOKENS = {
+            "no", "yes", "ok",
+            "sí", "si",
+            "no_reply", "noreply", "no reply",
+            "done", "ack",
+        }
+
+        def _is_trivial_token(piece: str) -> bool:
+            return piece.lower().strip(".!?_- ") in _TRIVIAL_TOKENS
+
         deduped: list[str] = []
         for piece in all_text_pieces:
             cleaned = piece.strip()
@@ -348,12 +369,7 @@ class OpenClawConversationEntity(
             if deduped and deduped[-1] == cleaned:
                 continue
             deduped.append(cleaned)
-        if len(deduped) > 1:
-            # If the last piece is suspiciously short/trivial AND we have
-            # a longer one before it, drop the trivial tail.
-            trivial = {"no", "yes", "ok", "sí", "si", "sí.", "no.", "ok."}
-            if deduped[-1].lower().strip(".!?") in trivial:
-                deduped = deduped[:-1]
+        deduped = [p for p in deduped if not _is_trivial_token(p)]
         final_text = "\n\n".join(deduped).strip() or "Listo."
 
         # Persist the chain head AFTER the loop converges, so we don't

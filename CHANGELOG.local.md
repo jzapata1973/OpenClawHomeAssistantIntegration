@@ -4,6 +4,62 @@
 
 ---
 
+## [2.1.3] · 2026-05-11 — Filtrar `NO_REPLY` (token interno de Qwen3)
+
+### Síntoma residual de v2.1.2
+
+A pesar del fix de acumulación + drop trivial trailing, seguíamos viendo "No response from OpenClaw" en HA Assist. Diagnóstico (cortesía de un sub-agente que revisó la sesión):
+
+El modelo Qwen3 emite el **token interno `NO_REPLY`** después de ejecutar una tool, significando *"listo, nada que agregar"*. Nuestro set trivial de v2.1.2 (`{"no", "yes", "ok", "sí", "si", "sí.", "no.", "ok."}`) NO incluía `NO_REPLY` → se concatenaba al final del speech → HA Assist lo trataba como respuesta vacía/inválida → renderizaba "No response from OpenClaw".
+
+Flujo observado:
+
+```
+iter 1: text="Luces de tu pieza encendidas. 💡" + tool_call HassTurnOn
+HA ejecuta turn_on (OK)
+iter 2: model recibe el resultado → emite "NO_REPLY"
+final_text v2.1.2 = "Luces de tu pieza encendidas. 💡\n\nNO_REPLY"
+HA Assist lo trata como respuesta vacía → "No response from OpenClaw"
+```
+
+### Fix
+
+`conversation.py`:
+
+1. **Expandir el set trivial** para incluir tokens internos de Qwen3:
+   ```python
+   _TRIVIAL_TOKENS = {
+       "no", "yes", "ok",
+       "sí", "si",
+       "no_reply", "noreply", "no reply",
+       "done", "ack",
+   }
+   ```
+
+2. **Dropear tokens triviales desde CUALQUIER posición** (no solo trailing). Es más simple y robusto:
+   ```python
+   deduped = [p for p in deduped if not _is_trivial_token(p)]
+   ```
+   `_is_trivial_token` normaliza a lowercase y strip de `.!?_- ` antes de comparar.
+
+3. **Fallback a `"Listo."`** si el filtro vacía todo el response (mejor que mandar empty a HA Assist).
+
+4. **Reforzar instructions** mencionando explícitamente `NO_REPLY`:
+   ```
+   Nunca respondas solamente con 'NO', 'OK', 'YES', 'NO_REPLY' u otros
+   tokens internos cortos — siempre una oración descriptiva.
+   ```
+
+### Observación lateral
+
+El sub-agente que diagnosticó este bug también aplicó **poda del workspace de `nabu-home` en OpenClaw** (probablemente reducir AGENTS.md/SOUL.md/MEMORY.md). Eso debería ayudar con los timeouts de >60s que veíamos por chain pesado, además del fix de v2.1.3 acá.
+
+### Próximo paso obligado
+
+Esto es el 4to hotfix en un día. Síntoma claro de que estamos parchando. **v2.2.0 con streaming SSE va a hacer la mayoría de estas heurísticas innecesarias** — el chat_log de HA absorbe deltas progresivos y maneja todo internamente. Las heurísticas de filtro se mantienen como defensa en profundidad.
+
+---
+
 ## [2.1.2] · 2026-05-11 — Acumulación de texto + filtro de respuestas triviales
 
 ### Síntoma
