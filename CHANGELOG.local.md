@@ -4,6 +4,52 @@
 
 ---
 
+## [2.1.4] · 2026-05-11 — Re-anchor instructions + chain guard contra estados "modelo se rindió"
+
+Dos micro-fixes defensivos sugeridos por un sub-agente externo después de ver que v2.1.3, aún filtrando `NO_REPLY` bien, igual podía caer en el patrón "modelo emite solo trivial / fallback se repite turn-a-turn".
+
+### Fix A — instructions en cada user turn (no solo en el primer ever del chain)
+
+**Antes (v2.0.0 – v2.1.3):**
+```python
+send_instructions = instructions if previous_response_id is None else None
+```
+Las instructions iban en el primer turn del chain solamente. Si el chain ya existía (`previous_response_id` set), no se enviaban más → el gateway debía cargarlas server-side.
+
+**Problema observado:** Qwen3 a veces "deriva" — empieza a emitir tokens crudos como `NO_REPLY` o frases sueltas al cabo de varios turns, como si las instructions originales se diluyeran entre los `function_call_output` intermedios del chain.
+
+**Fix:** mandar instructions SIEMPRE en la primera iteración de cada user turn. Dentro del tool-call loop seguimos sin re-mandarlas (no-op gateway-side). Cost: ~300 chars extra por user turn. Trivial.
+
+### Fix B — no avanzar el chain cuando final_text fue al fallback "Listo."
+
+Si el filtro de v2.1.3 dropea TODO lo que el modelo emitió en este user turn (porque eran solo tokens triviales / NO_REPLY) y caemos al fallback `"Listo."`, **no actualizar `chain_store.last_response_id`** con el `response.id` de este turn.
+
+**Por qué:** si avanzamos a un response_id cuyo contenido es "modelo se rindió", el próximo user turn lo carga como contexto y tiende a heredar el patrón → más turns triviales en cadena. Quedándonos en el `previous_response_id` anterior (el último response útil del modelo), el siguiente turn arranca desde un estado más sano.
+
+```python
+chain_is_clean = final_text != "Listo."
+if final_response_id and chain_is_clean:
+    await self._chain_store.async_set_last(session_key, final_response_id)
+elif final_response_id:
+    _LOGGER.debug("Dropping response_id; final output collapsed to fallback")
+```
+
+### Diagnóstico complementario aportado por el sub-agente
+
+Cuando v2.1.3 mostraba "No response from OpenClaw" en HA Assist aunque la versión instalada decía 2.1.3:
+
+> "Asegurate que v2.1.3 está realmente cargado:  
+> HA → Settings → Devices & Services → OpenClaw → ⋮ → Reload  
+> (o full restart de HA si reload no se ofrece)"
+
+Python puede cachear el módulo `conversation.py` viejo aunque HACS haya copiado los archivos nuevos. Reload de la integration (o restart full) fuerza recargar el código.
+
+> "Borrar el chain store: rm /config/.storage/openclaw_chain.json"
+
+Si el chain `homeassistant-jaz` arrastra el patrón malo de turns previos donde `NO_REPLY` se propagó, ningún fix de filtro alcanza — hay que empezar limpio.
+
+---
+
 ## [2.1.3] · 2026-05-11 — Filtrar `NO_REPLY` (token interno de Qwen3)
 
 ### Síntoma residual de v2.1.2
