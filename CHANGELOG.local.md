@@ -4,6 +4,84 @@
 
 ---
 
+## [2.1.8] · 2026-05-11 — Schema fix de message replay + rotación de `user` por `conversation_id` + WARN visibility
+
+### Bugs encontrados por code-review del sub-agente externo (sobre v2.1.7)
+
+**Bug A — schema inválido al replay de `message` items en el tool-call loop**
+
+En `conversation.py` (línea ~370 de v2.1.7), procesando cada item del response del modelo:
+
+```python
+elif item_type == "message":
+    ...
+    input_items.append(item)   # ← item.content = [{type:"output_text",text:...}]
+```
+
+El OpenAI Responses API es estricto: `output_text` solo es válido en `output[]`; un input message debe llevar `content` como string plano (o `[{type:"input_text",...}]`). Re-shipear el item raw del response como input produce un payload que el gateway rechaza/malinterpreta silenciosamente — el chain se rompe en multi-iter sin error visible. Bug latente que **podía** estar contribuyendo al "modelo no responde / NO_REPLY".
+
+**Bug B — `user` constante hace que el gateway siga cargando contexto contaminado**
+
+v2.1.6/v2.1.7 ya pusieron `previous_response_id=None` (ni cross-turn ni in-loop). Pero el campo `user` seguía constante (`casajaz-fresh-2026-05-11` o lo que el usuario haya configurado en "Assist session ID override"). Hipótesis fuerte del sub-agente: **el gateway de OpenClaw también indexa session state por `user`** — carga historial server-side de turns anteriores SOLO con ese string. Sin chain en `previous_response_id` pero con `user` igual, el contexto contaminado del lado servidor sigue ahí.
+
+Sin acceso a logs del gateway no podemos confirmar esto al 100%, pero la apuesta es lógica: rotar `user` por Assist conversation no rompe nada en el peor caso y resuelve si la hipótesis es cierta.
+
+### Fixes v2.1.8
+
+**Fix A — convertir message output → input válido en el loop:**
+
+```python
+elif item_type == "message":
+    collected: list[str] = []
+    for piece in item.get("content", []) or []:
+        if piece.get("type") == "output_text":
+            txt = piece.get("text") or ""
+            if txt:
+                collected.append(txt)
+    if collected:
+        text_pieces.extend(collected)
+        input_items.append({
+            "type": "message",
+            "role": "assistant",
+            "content": "\n".join(collected),
+        })
+```
+
+Items `message` ahora se appendean a `input_items` con `content` como string plano — schema válido para next iter.
+
+**Fix B — rotar `user` por `conversation_id`:**
+
+```python
+def _resolve_session_key(self, agent_name, user_input=None):
+    base = configured_override or f"openclaw-{entry_id[:8]}-{agent}"
+    conv_id = (user_input.conversation_id or "").strip()[:24]
+    return f"{base}:{conv_id}" if conv_id else base
+```
+
+Cada Assist conversation tiene un `conversation_id` distinto desde HA → cada conversación mapea a una sesión gateway-side fresca. Dentro de una misma conversación (turns múltiples) el `user` se mantiene → comportamiento normal de Assist.
+
+**Fix C — log WARN del payload en iter 0:**
+
+```python
+_LOGGER.warning(
+    "OpenClaw v2.1.8 → POST /v1/responses | model=openclaw/%s | "
+    "user=%r | input_items=%d | tools=%d | instructions_len=%d",
+    agent_name, session_key, len(input_items), len(tools),
+    len(instructions),
+)
+```
+
+Visible en logs default sin habilitar debug. Permite ver de un vistazo qué `user` se está rotando, sin necesidad de tocar configuración de logger.
+
+### Para confirmar la hipótesis de Bug B (próximo paso)
+
+Si el sub-agente del lado OpenClaw puede ver los logs del gateway cuando HA hace una request, debería confirmar:
+- El campo `user` en el body recibido cambia entre Assist conversations distintas.
+- El campo `user` se mantiene dentro de una misma Assist conversation.
+- Si el gateway efectivamente carga menos contexto cuando el `user` es nuevo.
+
+---
+
 ## [2.1.7] · 2026-05-11 — Cero chain también dentro del tool-call loop
 
 ### Por qué v2.1.6 no alcanzó
