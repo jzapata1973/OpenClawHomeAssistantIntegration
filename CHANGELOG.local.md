@@ -4,6 +4,31 @@
 
 ---
 
+## [2.1.1] · 2026-05-11 — Hotfix: timeout para `/v1/responses`
+
+### Síntoma
+
+Después del primer chat (que andaba bien), el segundo "apagalas ahora" cortaba con:
+
+```
+Cannot reach OpenClaw gateway at http://192.168.10.40:18789/v1/responses:
+Timeout on reading data from socket
+```
+
+### Causa
+
+`async_send_responses()` reusaba `STREAM_TIMEOUT = ClientTimeout(total=300, sock_read=120)`. Ese timeout fue diseñado para SSE streaming de chat-completions donde llegan deltas cada pocos segundos. **`/v1/responses` non-streaming NO manda nada hasta que el modelo tiene la respuesta completa**. Para Qwen 27B local procesando una request con chain creciente (123k tokens / 48% del context window) en el segundo turn, el agente puede tardar >2 minutos sin emitir un byte → `sock_read=120s` se agota.
+
+### Fix
+
+Nuevo `RESPONSES_TIMEOUT = ClientTimeout(total=600, sock_read=300)` dedicado al endpoint nativo. Generoso pero realista hasta que v2.2.0 traiga streaming SSE real (que evita el problema completamente porque cada token reset-ea el sock_read).
+
+### Mientras tanto, si el chain crece mucho
+
+Si los turns se ponen muy lentos (gateway procesando más de 5min), podés resetear manualmente el chain borrando `config/.storage/openclaw_chain.json`. La próxima conversación arranca limpia. Service `openclaw.reset_chain` viene en v2.2.0.
+
+---
+
 ## [2.1.0] · 2026-05-11 — Tools nativas de HA inyectadas en cada request
 
 ### Problema que resuelve

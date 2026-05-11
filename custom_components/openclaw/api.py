@@ -24,6 +24,14 @@ API_TIMEOUT = aiohttp.ClientTimeout(total=10)
 # Timeout for streaming chat completions (long-running)
 STREAM_TIMEOUT = aiohttp.ClientTimeout(total=300, sock_read=120)
 
+# Timeout for /v1/responses (non-streaming, see CHANGELOG v2.1.1).
+# OpenClaw's responses endpoint sends nothing until the model has the
+# whole answer assembled — for a 27B local model in a tool-call loop
+# with a growing chain that can easily exceed 2 minutes per turn,
+# busting the sock_read window of STREAM_TIMEOUT. Generous values
+# until v2.2.0 ships true SSE streaming.
+RESPONSES_TIMEOUT = aiohttp.ClientTimeout(total=600, sock_read=300)
+
 
 class OpenClawApiError(Exception):
     """Base exception for OpenClaw API errors."""
@@ -579,7 +587,7 @@ class OpenClawApiClient:
                 url,
                 headers=headers,
                 json=payload,
-                timeout=STREAM_TIMEOUT,
+                timeout=RESPONSES_TIMEOUT,
                 ssl=self._ssl_param,
             ) as resp:
                 body = await resp.text()
