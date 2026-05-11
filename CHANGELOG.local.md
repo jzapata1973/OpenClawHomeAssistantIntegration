@@ -4,6 +4,83 @@
 
 ---
 
+## [2.1.0] · 2026-05-11 — Tools nativas de HA inyectadas en cada request
+
+### Problema que resuelve
+
+v2.0.0 routeaba bien al agente y mantenía la sesión, pero **NO inyectaba tools** en el payload de `/v1/responses` — solo mandaba `input` + un texto vago en `instructions` diciendo "usá las tools del MCP del agente". El agente OpenClaw entonces tenía dos caminos:
+
+1. Usar el server MCP de HA configurado en `openclaw-mcp-adapter` (lo correcto).
+2. Improvisar `curl http://192.168.10.21:8123/api/...` o similar (lo incorrecto).
+
+A veces tomaba el camino #2 → HA respondía 401 → notificación **"Login attempt failed from 192.168.10.40"** que vimos el 2026-05-10.
+
+Adicionalmente, el system prompt cargaba archivos pesados del workspace del agente (`AGENTS.md`, `SOUL.md`, `MEMORY.md`) y/o el dump de entidades expuestas (~13k chars).
+
+### Solución (v2.1.0)
+
+Patrón estándar de HA, igual que `homeassistant.components.openai_conversation`:
+
+1. **`conversation.py` reescrito como `ConversationEntity`** (entity moderna) en vez del viejo `AbstractConversationAgent` registrado vía `async_set_agent`. Hereda de `conversation.ConversationEntity` + `conversation.AbstractConversationAgent` para retrocompat.
+
+2. **HA expone sus tools al agente**:
+   ```python
+   await chat_log.async_provide_llm_data(
+       user_input.as_llm_context(DOMAIN), "assist",
+       user_llm_prompt=instructions,
+   )
+   tools = [_format_tool_for_responses(t) for t in chat_log.llm_api.tools]
+   ```
+   Eso da `HassTurnOn`, `HassClimateSetTemperature`, `HassMediaPause`, etc., **automáticamente filtradas por las entidades expuestas a Assist**. Cero configuración manual de qué tools mostrar.
+
+3. **Tool-call loop manual** (no streaming todavía):
+   - Mandamos `/v1/responses` con `tools=[...]` + `input=[user_message]`.
+   - Si la response trae items `function_call`, los ejecutamos vía `chat_log.llm_api.async_call_tool(...)`.
+   - Mandamos siguiente turno con `input=[function_call_output items]` y `previous_response_id` actualizado.
+   - Repetir hasta que la response venga sin `function_call` (solo texto final).
+   - Tope: `MAX_TOOL_ITERATIONS = 8` para evitar loops infinitos.
+
+4. **`api.py async_send_responses` extendido** para aceptar `tools: list[dict]` y `input_items: list[dict]` (además del `input_text: str` original).
+
+5. **`_format_tool_for_responses(llm.Tool) -> dict`** — convierte una tool de HA al schema OpenAI Responses, removiendo keywords no soportadas (`oneOf`, `anyOf`, `allOf`, `enum`, `not`).
+
+### Pre-requisito de servidor
+
+OpenClaw debe forwardear el campo `tools` del payload al modelo subyacente. Para vLLM Qwen3.6 se hace habilitando el parser correcto en el wrapper de vLLM:
+
+```
+--tool-call-parser qwen3_coder
+```
+
+(Verificable: si después del upgrade el agente responde "no sé hacer eso" en vez de ejecutar acciones, el problema está acá.)
+
+### Cambios concretos
+
+- `conversation.py` — reescrito por completo. ~280 líneas. Mantiene la lectura de las opciones legacy (`Agent ID`, `Voice agent ID`, `Assist session ID override`).
+- `api.py` — `async_send_responses` ahora acepta `tools` + `input_items`.
+- `manifest.json` — bump a 2.1.0.
+- `__init__.py` — sin cambios (el `async_forward_entry_setups` ya cubría `conversation` platform; ahora se carga la entity en lugar de registrar un agent).
+
+### Lo que NO cambia (sigue funcionando igual)
+
+- Sensores, binary sensors, button, select, event, coordinator → idénticos.
+- Service handlers `openclaw.send_message`/`clear_history`/`invoke_tool` → idénticos (aún en `/v1/chat/completions`, heredan los bugs de v1.x). Migración a v2.2.0.
+- Chat card Lovelace → idéntica.
+- ChainStore (`config/.storage/openclaw_chain.json`) → mismo formato; el chain de v2.0.0 se sigue respetando.
+
+### Token saving esperado
+
+- **Sin v2.1.0:** instructions ~13.000 chars + agente cargando AGENTS.md/SOUL.md/MEMORY.md por su cuenta.
+- **Con v2.1.0:** instructions ~300 chars (un párrafo corto) + tools schema (~unos KB, depende de cuántas entidades estén expuestas). HA solo manda lo que el agente realmente necesita ver.
+
+### Limitaciones / próximas
+
+- Aún sin streaming (response llega completa). Streaming SSE con parsing del flujo de events de OpenResponses → v2.2.0.
+- Service handlers siguen rotos. Migración → v2.2.0.
+- `voluptuous_openapi.convert` se importa con fallback defensivo por si en alguna versión vieja de HA no está presente.
+
+---
+
 ## [2.0.0] · 2026-05-10 — Migración interna a `/v1/responses` nativo
 
 **Breaking change interno**, **upgrade transparente para el usuario**: si HACS te ofrece v1.0.3 → v2.0.0, aceptás, reiniciás HA, y todo sigue funcionando. La config entry vieja se sigue leyendo (mismos campos: `gateway_host`, `gateway_port`, `agent_id`, `assist_session_id`, etc.). No se borran sensores, ni botones, ni el select, ni el servicio `openclaw.send_message`, ni la chat card.
