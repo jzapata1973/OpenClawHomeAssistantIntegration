@@ -69,6 +69,74 @@ _LOGGER = logging.getLogger(__name__)
 # pathological loops where the model keeps requesting tools forever.
 MAX_TOOL_ITERATIONS = 8
 
+# v2.1.6: cap on how many prior chat_log items we replay to the gateway
+# at the start of each user turn. Each Assist conversation typically has
+# under ~30 items unless the user is doing a long-running back-and-forth.
+# Capping protects against worst-case payload bloat while keeping enough
+# context for sensible follow-up handling.
+MAX_HISTORY_ITEMS = 40
+
+
+def _convert_chat_log_to_input_items(
+    chat_log_content,
+) -> list[dict[str, Any]]:
+    """Convert HA ``chat_log.content`` into OpenAI-Responses ``input`` items.
+
+    Maps each content type to its OpenResponses counterpart:
+    - ``UserContent`` → ``{"type": "message", "role": "user", "content": …}``
+    - ``AssistantContent``: text → message item;
+      ``tool_calls`` (if any) → ``function_call`` items
+    - ``ToolResultContent`` → ``function_call_output`` item
+    - ``SystemContent`` → skipped (we ship those via ``instructions``)
+
+    Defensive against unknown shapes — anything we don't recognize is
+    skipped silently rather than crashing the whole turn.
+    """
+    items: list[dict[str, Any]] = []
+    for entry in chat_log_content or []:
+        if isinstance(entry, conversation.UserContent):
+            text = (getattr(entry, "content", None) or "").strip()
+            if text:
+                items.append(
+                    {"type": "message", "role": "user", "content": text}
+                )
+        elif isinstance(entry, conversation.AssistantContent):
+            text = (getattr(entry, "content", None) or "").strip()
+            if text:
+                items.append(
+                    {"type": "message", "role": "assistant", "content": text}
+                )
+            for tc in (getattr(entry, "tool_calls", None) or []):
+                call_id = getattr(tc, "id", None) or getattr(tc, "tool_name", "")
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": str(call_id),
+                        "name": getattr(tc, "tool_name", "") or "",
+                        "arguments": json.dumps(
+                            getattr(tc, "tool_args", None) or {},
+                            default=str,
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
+        elif isinstance(entry, conversation.ToolResultContent):
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": str(getattr(entry, "tool_call_id", "")),
+                    "output": json.dumps(
+                        getattr(entry, "tool_result", None),
+                        default=str,
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+        # SystemContent and any unknown types are intentionally skipped.
+    if len(items) > MAX_HISTORY_ITEMS:
+        items = items[-MAX_HISTORY_ITEMS:]
+    return items
+
 
 def _format_tool_for_responses(tool: llm.Tool) -> dict[str, Any]:
     """Convert an HA ``llm.Tool`` into an OpenAI-Responses function tool dict.
@@ -205,23 +273,29 @@ class OpenClawConversationEntity(
         if chat_log.llm_api:
             tools = [_format_tool_for_responses(t) for t in chat_log.llm_api.tools]
 
-        previous_response_id = self._chain_store.get_last(session_key)
+        # v2.1.6: STOP using cross-turn `previous_response_id` chaining.
+        #
+        # The smoking-gun diagnosis: when the model emits text + a
+        # function_call in the same response (e.g. "Listo, encendí..."
+        # alongside HassTurnOn), that whole response gets cemented in the
+        # server-side chain. The next user turn loads that context and
+        # the model "learns" the pattern "say success without actually
+        # calling the tool" — so subsequent turns skip the function_call
+        # entirely. Lights don't actually toggle, model still claims they
+        # do. Verified by a GetLiveContext turn that showed all lights
+        # OFF after a chain-poisoned "encendí" claim.
+        #
+        # Fix: each user turn is self-contained from the gateway's POV.
+        # We send the whole conversation history as `input` items
+        # (re-built from chat_log.content), no `previous_response_id`.
+        # WITHIN the tool-call loop we DO advance previous_response_id
+        # locally so we don't have to resend the growing history on each
+        # iteration — but that local advance never leaves this turn.
+        previous_response_id: str | None = None
+        input_items = _convert_chat_log_to_input_items(chat_log.content)
 
-        # First call's input is just the new user message. Subsequent
-        # calls (driven by function_calls in the response) replace
-        # input_items with function_call_output items.
-        input_items: list[dict[str, Any]] = [
-            {"type": "message", "role": "user", "content": user_input.text}
-        ]
-
-        # v2.1.4: always send `instructions` on the FIRST iteration of
-        # each user turn, even when previous_response_id is set. The
-        # gateway technically carries them server-side after the first
-        # turn of a chain, but Qwen3 sometimes drifts (e.g. starts
-        # emitting raw NO_REPLY) when the original instructions get
-        # diluted by intermediate tool_call_output items in the chain.
-        # Re-asserting them once per user turn re-anchors the behavior
-        # for the cost of ~300 extra chars (cheap).
+        # Always send `instructions` on iteration 0 of each user turn
+        # (kept from v2.1.4).
         send_instructions: str | None = instructions
 
         # v2.1.2: accumulate text across ALL iterations rather than only
@@ -375,28 +449,13 @@ class OpenClawConversationEntity(
         deduped = [p for p in deduped if not _is_trivial_token(p)]
         final_text = "\n\n".join(deduped).strip() or "Listo."
 
-        # Persist the chain head AFTER the loop converges, so we don't
-        # advance into a partial state if the loop errored mid-way.
-        #
-        # v2.1.4: also DON'T advance the chain when the final output was
-        # filtered down to the "Listo." fallback (which means the model
-        # only emitted trivial / NO_REPLY tokens). If we advance into a
-        # turn whose chain state is "the model gave up", the next user
-        # turn inherits that pattern and tends to keep emitting trivial
-        # responses. Staying on the previous good response_id breaks the
-        # loop and the next turn starts from a healthier state.
-        chain_is_clean = final_text != "Listo."
-        if final_response_id and chain_is_clean:
-            await self._chain_store.async_set_last(
-                session_key, final_response_id
-            )
-        elif final_response_id:
-            _LOGGER.debug(
-                "Dropping response_id %s; final output collapsed to the "
-                "trivial-fallback. session_key=%s",
-                final_response_id,
-                session_key,
-            )
+        # v2.1.6: chain_store no longer drives cross-turn continuity.
+        # Each user turn rebuilds its input from chat_log.content, so we
+        # don't persist a `last_response_id` here. The ChainStore stays
+        # imported / instantiated for backwards compatibility (older
+        # config entries reference it) but we leave it untouched.
+        # See CHANGELOG v2.1.6 for the rationale.
+        _ = final_response_id  # consumed only within the loop now
 
         self._coordinator.update_last_activity()
 
