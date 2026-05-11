@@ -273,25 +273,26 @@ class OpenClawConversationEntity(
         if chat_log.llm_api:
             tools = [_format_tool_for_responses(t) for t in chat_log.llm_api.tools]
 
-        # v2.1.6: STOP using cross-turn `previous_response_id` chaining.
+        # v2.1.7: NEVER pass `previous_response_id` — not even WITHIN
+        # the tool-call loop of a single user turn.
         #
-        # The smoking-gun diagnosis: when the model emits text + a
-        # function_call in the same response (e.g. "Listo, encendí..."
-        # alongside HassTurnOn), that whole response gets cemented in the
-        # server-side chain. The next user turn loads that context and
-        # the model "learns" the pattern "say success without actually
-        # calling the tool" — so subsequent turns skip the function_call
-        # entirely. Lights don't actually toggle, model still claims they
-        # do. Verified by a GetLiveContext turn that showed all lights
-        # OFF after a chain-poisoned "encendí" claim.
+        # v2.1.6 still used it as a local optimization inside the loop
+        # so we wouldn't have to resend the growing history between
+        # tool iterations. Sub-agent debugging found that even that
+        # in-loop chaining causes OpenClaw's gateway to inject a
+        # "[Chat messages since your last reply - for context]" text
+        # wrapper into the user message, which Qwen3 reads as "you
+        # already replied" and answers with NO_REPLY. Removing the
+        # chain entirely (in-loop and cross-turn) eliminates both the
+        # wrapper and the cross-turn contamination from v2.1.0–v2.1.5.
         #
-        # Fix: each user turn is self-contained from the gateway's POV.
-        # We send the whole conversation history as `input` items
-        # (re-built from chat_log.content), no `previous_response_id`.
-        # WITHIN the tool-call loop we DO advance previous_response_id
-        # locally so we don't have to resend the growing history on each
-        # iteration — but that local advance never leaves this turn.
-        previous_response_id: str | None = None
+        # Each iteration's request is fully self-contained: it carries
+        # the whole history accumulated so far in `input_items`
+        # (initial chat_log.content, plus every `message`/`function_call`
+        # item the model emitted in prior iterations of this turn, plus
+        # every `function_call_output` we produced). That mirrors the
+        # OpenAI Responses non-streaming pattern that does not rely on
+        # `previous_response_id`.
         input_items = _convert_chat_log_to_input_items(chat_log.content)
 
         # Always send `instructions` on iteration 0 of each user turn
@@ -312,7 +313,7 @@ class OpenClawConversationEntity(
                     model=f"openclaw/{agent_name}",
                     input_items=input_items,
                     user=session_key,
-                    previous_response_id=previous_response_id,
+                    previous_response_id=None,  # v2.1.7: zero chain
                     instructions=send_instructions,
                     tools=tools or None,
                 )
@@ -322,16 +323,20 @@ class OpenClawConversationEntity(
                 )
                 return self._error(user_input, str(err))
 
-            # After the first call, only the `input` and the chain
-            # advance. Stop sending `instructions` again.
+            # After the first call, no point re-shipping `instructions`
+            # for the same user turn — the model has them already and
+            # they would just consume tokens.
             send_instructions = None
 
             response_id = response.get("id")
             if response_id:
                 final_response_id = response_id
-                previous_response_id = response_id
 
-            # Extract function_calls + any partial text from this response.
+            # Walk the response items, accumulating BOTH the textual
+            # content for our `final_text` AND the items themselves into
+            # `input_items` so the NEXT iteration carries them as the
+            # model's previous turn-in-progress. This is what replaces
+            # `previous_response_id` chaining in v2.1.7.
             tool_calls: list[dict[str, Any]] = []
             text_pieces: list[str] = []
             for item in response.get("output", []) or []:
@@ -344,12 +349,25 @@ class OpenClawConversationEntity(
                             "arguments": item.get("arguments", "{}"),
                         }
                     )
+                    # Replay this call back to the model in the next
+                    # iteration so it knows what it just decided.
+                    input_items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": item.get("call_id"),
+                            "name": item.get("name"),
+                            "arguments": item.get("arguments", "{}"),
+                        }
+                    )
                 elif item_type == "message":
                     for piece in item.get("content", []) or []:
                         if piece.get("type") == "output_text":
                             txt = piece.get("text") or ""
                             if txt:
                                 text_pieces.append(txt)
+                    # Also keep the assistant message in the running
+                    # conversation so the next iteration sees it.
+                    input_items.append(item)
 
             if text_pieces:
                 all_text_pieces.extend(text_pieces)
@@ -358,10 +376,9 @@ class OpenClawConversationEntity(
                 # Model is done — no more tools requested this turn.
                 break
 
-            # Execute the requested tools and stage their outputs as the
-            # input for the next iteration. The gateway already has the
-            # function_call items in the chain via previous_response_id.
-            input_items = []
+            # Execute each requested tool and append its result to
+            # `input_items` (paired by call_id with the function_call
+            # already appended above).
             for call in tool_calls:
                 try:
                     args = (
