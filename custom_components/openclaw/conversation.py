@@ -171,7 +171,11 @@ class OpenClawConversationEntity(
             "Respondé en el idioma del usuario, breve y al grano. "
             "Tenés tools nativas de Home Assistant (HassTurnOn, "
             "HassClimateSetTemperature, etc.) para leer estados y accionar "
-            "dispositivos — usá esas tools, NUNCA improvises HTTP requests."
+            "dispositivos — usá esas tools, NUNCA improvises HTTP requests. "
+            "Después de ejecutar una tool, SIEMPRE cerrá con un mensaje "
+            "breve en el idioma del usuario describiendo qué pasó (ej. "
+            '"Listo, encendí 5 luces" o "La temperatura es 23°C"). '
+            "Nunca respondas solamente con 'NO', 'OK' o 'YES' sueltos."
         )
 
     # ── core message handler ─────────────────────────────────────────
@@ -216,7 +220,12 @@ class OpenClawConversationEntity(
             instructions if previous_response_id is None else None
         )
 
-        final_text = ""
+        # v2.1.2: accumulate text across ALL iterations rather than only
+        # taking the last one. Qwen3.6 sometimes emits its useful summary
+        # in the iteration that also contains the function_call, and then
+        # follows up with a useless one-word response ("NO", "OK") in the
+        # post-tool iteration, which used to overwrite the good text.
+        all_text_pieces: list[str] = []
         final_response_id: str | None = None
 
         for iteration in range(MAX_TOOL_ITERATIONS):
@@ -265,7 +274,7 @@ class OpenClawConversationEntity(
                                 text_pieces.append(txt)
 
             if text_pieces:
-                final_text = "\n".join(text_pieces).strip()
+                all_text_pieces.extend(text_pieces)
 
             if not tool_calls:
                 # Model is done — no more tools requested this turn.
@@ -320,11 +329,32 @@ class OpenClawConversationEntity(
                 MAX_TOOL_ITERATIONS,
                 session_key,
             )
-            if not final_text:
-                final_text = (
+            if not all_text_pieces:
+                all_text_pieces.append(
                     "No pude completar la consulta — se alcanzó el límite "
                     "de iteraciones de tools."
                 )
+
+        # Compose the final reply for HA Assist. Deduplicate adjacent
+        # repeats (some Qwen runs emit the same announcement twice across
+        # iterations) and drop trivial one-word responses if there's a
+        # better piece available — Qwen occasionally answers a final "NO"
+        # alone after correctly summarising in a prior iteration.
+        deduped: list[str] = []
+        for piece in all_text_pieces:
+            cleaned = piece.strip()
+            if not cleaned:
+                continue
+            if deduped and deduped[-1] == cleaned:
+                continue
+            deduped.append(cleaned)
+        if len(deduped) > 1:
+            # If the last piece is suspiciously short/trivial AND we have
+            # a longer one before it, drop the trivial tail.
+            trivial = {"no", "yes", "ok", "sí", "si", "sí.", "no.", "ok."}
+            if deduped[-1].lower().strip(".!?") in trivial:
+                deduped = deduped[:-1]
+        final_text = "\n\n".join(deduped).strip() or "Listo."
 
         # Persist the chain head AFTER the loop converges, so we don't
         # advance into a partial state if the loop errored mid-way.

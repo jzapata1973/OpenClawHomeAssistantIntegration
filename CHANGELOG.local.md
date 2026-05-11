@@ -4,6 +4,57 @@
 
 ---
 
+## [2.1.2] · 2026-05-11 — Acumulación de texto + filtro de respuestas triviales
+
+### Síntoma
+
+Después del fix de timeout, el usuario probó "prende las luces de mi pieza":
+
+- **Físicamente**: las luces SÍ se prendieron ✅ (la tool `HassTurnOn` se ejecutó OK).
+- **Texto que recibió HA Assist**: `"No response from OpenClaw"` 😶
+
+En el chat de OpenClaw web se veían 2 turnos del agente:
+
+1. `function_call(HassTurnOn, [...])` + texto **"Luces de tu pieza encendidas. 💡"**
+2. Después del `function_call_output`: texto **"NO"** (solo eso).
+
+### Causa
+
+El loop de v2.1.0/2.1.1 sobrescribía `final_text` en cada iteración con el `output_text` del response actual. Resultado: la iteración 2 con `"NO"` pisaba el `"Luces de tu pieza encendidas. 💡"` útil de la iteración 1. Y HA Assist parece tratar respuestas tan cortas / no-respuestas como "no response" en la UI.
+
+Patrón de Qwen3.6 observado: en el mismo turno que emite un `function_call` también emite la "anunciación" del resultado (asume éxito). En el turno post-tool, a veces solo emite una palabra ("NO", "OK") en vez del resumen — comportamiento del modelo local, no es bug del gateway ni nuestro.
+
+### Fix
+
+`conversation.py`:
+
+1. **Acumular** `output_text` de TODAS las iteraciones en `all_text_pieces` (en vez de overwrite).
+2. **Dedupe adyacente** — si dos iteraciones emiten exactamente el mismo texto, mantener uno solo.
+3. **Drop trailing trivial** — si la última pieza es `"NO"` / `"YES"` / `"OK"` / `"sí"` (case-insensitive, sin puntuación) y hay alguna pieza anterior con contenido real, descartar la trivial.
+4. **Fallback** — si después de todo no queda nada, devolver `"Listo."` (no string vacío) para que HA Assist no muestre "No response from OpenClaw".
+
+Y refuerzo de instructions:
+
+```
+Después de ejecutar una tool, SIEMPRE cerrá con un mensaje breve en el
+idioma del usuario describiendo qué pasó. Nunca respondas solamente con
+'NO', 'OK' o 'YES' sueltos.
+```
+
+### Resultado esperado en HA Assist
+
+Para "prende las luces de mi pieza":
+
+- Antes: `"No response from OpenClaw"` 😶
+- Después (con suerte y modelo cooperativo): `"Listo, encendí 5 luces de tu pieza."` ✅
+- Después (si el modelo igual emite "NO" al final): `"Luces de tu pieza encendidas. 💡"` (porque dropeamos el "NO" trailing)
+
+### Mirando más adelante
+
+v2.2.0 con streaming SSE va a hacer este accumulation natural — cada delta se appendea al chat_log de HA automáticamente. Las heurísticas de filtro de "NO" trivial pueden quedar como protección defensiva.
+
+---
+
 ## [2.1.1] · 2026-05-11 — Hotfix: timeout para `/v1/responses`
 
 ### Síntoma
