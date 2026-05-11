@@ -4,6 +4,61 @@
 
 ---
 
+## [2.1.6] · 2026-05-11 — Turnos stateless desde el gateway (anti chain-contamination)
+
+### Smoking gun
+
+Diagnóstico aportado por el sub-agente que vino persiguiendo la cola del bug a través de v2.1.3 → v2.1.5. En la sesión con `previous_response_id` chaining:
+
+- Turn 1: usuario "prende las luces de mi pieza jaz". Modelo emite **en el mismo response** un `function_call(HassTurnOn)` Y texto "Listo, encendí las luces". Ese response queda cementado en la sesión server-side.
+- Turn 2: usuario "puedes verificar el estado". Modelo emite `function_call(HassGetState)` correctamente. Result: **todas las luces OFF** — significa que el turn 1 probablemente nunca corrió `HassTurnOn` realmente, o falló silenciosamente, o el modelo lo está saltando en turns subsecuentes.
+- Hipótesis confirmada por el log JSONL del gateway (línea 16, sub-agente lo vio): **el modelo "aprende" del chain que basta con anunciar éxito y empieza a saltarse el tool_call**. Solo texto en algunos turns, `stopReason: "stop"`, 15 tokens — sin `function_call` ninguno.
+
+### Por qué los fixes anteriores no alcanzaron
+
+- v2.1.3 filtraba `NO_REPLY` → bien, pero no es el problema aquí (el modelo ahora emite texto plausible, no garbage).
+- v2.1.4 chain guard contra `"Listo."` fallback + instructions every turn → bien, pero solo evita propagar el caso terminal-trivial. No el caso "el modelo se vuelve perezoso pero coherente".
+- v2.1.5 registrar `chat_log.async_add_assistant_content_without_tools(...)` → bien, HA ahora renderiza, pero el modelo **igual sigue mintiendo** sobre acciones que no ejecutó.
+
+El problema **no está en el filtrado** del output. Está en que el chain server-side TIENE turns previos donde el modelo emitió texto-de-éxito ALONGSIDE tool_calls. El modelo aprende ese patrón.
+
+### Fix estructural
+
+`conversation.py`:
+
+1. **NO leer `previous_response_id` desde `chain_store` al inicio del user turn.** Siempre arranca `None`.
+2. **Construir `input_items` desde `chat_log.content` cada user turn** vía un nuevo helper `_convert_chat_log_to_input_items()`. HA ya mantiene el historial local — UserContent, AssistantContent (incluyendo tool_calls que la AssistantContent lleva), ToolResultContent. Lo convertimos al schema de OpenResponses items (`message`, `function_call`, `function_call_output`).
+3. **WITHIN the tool-call loop**, `previous_response_id` SÍ se usa localmente — para no resendear el historial creciente en cada iteración dentro del mismo turn. Ese encadenamiento queda confinado a este turn.
+4. **NO escribir a `chain_store` al final.** El estado del chain server-side ya no nos importa — ni siquiera el "good" final response_id.
+5. `ChainStore` queda importado/inyectado para no romper el bag de `hass.data[DOMAIN][entry_id]` (otras partes del setup lo esperan), pero ahora es vestigial.
+
+### Costo / beneficio
+
+- **Costo**: cada user turn re-envía el historial local (~50–500 tokens dependiendo del largo de la conversación). Topa en `MAX_HISTORY_ITEMS = 40` para evitar crecimiento ilimitado.
+- **Beneficio**: cero chain contamination. El modelo no puede "aprender" patrones tóxicos del historial server-side porque ESE historial server-side nunca persiste cross-turn ahora.
+
+### Por qué esto es la causa raíz REAL
+
+Los anteriores v2.1.x parchearon **síntomas** de la chain contamination:
+- v2.1.3 → modelo emite tokens triviales → filtramos.
+- v2.1.4 → chain guard → no propagamos el peor caso.
+- v2.1.5 → HA no renderizaba el speech → registramos en chat_log.
+
+Pero el modelo seguía **degradando** turn-a-turn porque el chain le enseñaba malos hábitos. v2.1.6 ataca el origen: **eliminamos la fuente de aprendizaje contaminado**. Cada user turn ve el historial limpio que HA mantiene localmente, no la versión server-side eventualmente corrompida.
+
+### Lo que sigue siendo útil
+
+- Filtros de v2.1.3 → defensa contra Qwen emitiendo tokens internos.
+- Chain guard de v2.1.4 → ya no aplica (no escribimos al chain) pero la lógica subyacente (`final_text != "Listo."`) sigue siendo razonable como check de salud.
+- Instructions every turn de v2.1.4 → sigue.
+- chat_log register de v2.1.5 → sigue siendo necesario, sin esto HA no renderiza el speech.
+
+### Plan v2.2.0 (sigue pendiente)
+
+Refactor completo al patrón `openai_conversation` del core (`async_get_result_from_chat_log` + streaming SSE). v2.1.6 ya converge mucho más cerca de ese patrón — el siguiente paso natural es completar el espejo.
+
+---
+
 ## [2.1.5] · 2026-05-11 — Registrar assistant content en `chat_log` (causa raíz real del "No response from OpenClaw")
 
 ### Diagnóstico (crédito al sub-agente externo)
