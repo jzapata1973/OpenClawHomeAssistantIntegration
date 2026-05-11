@@ -530,22 +530,41 @@ class OpenClawApiClient:
         self,
         *,
         model: str,
-        input_text: str,
         user: str,
+        input_text: str | None = None,
+        input_items: list[dict[str, Any]] | None = None,
         previous_response_id: str | None = None,
         instructions: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """POST /v1/responses and return the parsed JSON response."""
+        """POST /v1/responses and return the parsed JSON response.
+
+        Pass either ``input_text`` (a single user message string) for a
+        simple turn, or ``input_items`` (a structured list of items) when
+        you need to ship ``function_call_output`` items in a tool-call
+        loop. ``tools`` is an array of OpenAI Responses function-tool
+        dicts, forwarded to the underlying model so it can emit
+        ``function_call`` items in its output.
+        """
         payload: dict[str, Any] = {
             "model": model,
-            "input": input_text,
             "user": user,
             "stream": False,
         }
+        if input_items is not None:
+            payload["input"] = input_items
+        elif input_text is not None:
+            payload["input"] = input_text
+        else:
+            raise ValueError(
+                "async_send_responses needs either input_text or input_items"
+            )
         if previous_response_id:
             payload["previous_response_id"] = previous_response_id
         if instructions:
             payload["instructions"] = instructions
+        if tools:
+            payload["tools"] = tools
 
         headers = {
             "Authorization": f"Bearer {self._token}",
