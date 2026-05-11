@@ -4,6 +4,74 @@
 
 ---
 
+## [2.1.7] · 2026-05-11 — Cero chain también dentro del tool-call loop
+
+### Por qué v2.1.6 no alcanzó
+
+v2.1.6 eliminó `previous_response_id` **cross-turn** (cada user turn empezaba con `None` y construía input desde `chat_log.content`), pero **dentro del tool-call loop** seguía encadenando localmente — pasando el `response.id` de la iteración anterior como `previous_response_id` de la siguiente, supuestamente "para no resendear historial creciente".
+
+Diagnóstico del sub-agente externo persiguiendo el JSONL del gateway: **ese encadenamiento in-loop dispara el wrapper "[Chat messages since your last reply - for context]"** que OpenClaw inserta en el siguiente request al modelo. Qwen3 lo lee como "el usuario ya vio mi respuesta anterior, no tengo que repetir" y emite `NO_REPLY`. Encima, ese contexto se cementa otra vez en la sesión server-side aunque sea "solo durante este turn".
+
+### Fix v2.1.7
+
+`previous_response_id=None` SIEMPRE — ni cross-turn ni in-loop. Para que el modelo en la iteración N+1 vea lo que decidió en N, **acumulamos los items del response en `input_items`** y los re-shipeamos en la próxima request, en el formato nativo de OpenAI Responses:
+
+```python
+for item in response.get("output", []):
+    if item["type"] == "function_call":
+        tool_calls.append(...)
+        input_items.append({          # replay back to the model
+            "type": "function_call",
+            "call_id": item["call_id"],
+            "name": item["name"],
+            "arguments": item["arguments"],
+        })
+    elif item["type"] == "message":
+        text_pieces.append(...)
+        input_items.append(item)      # keep the assistant message
+```
+
+Después de ejecutar cada tool, su result se agrega como `function_call_output`:
+
+```python
+input_items.append({
+    "type": "function_call_output",
+    "call_id": call["call_id"],
+    "output": json.dumps(tool_result),
+})
+```
+
+Cada iteración manda el growing `input_items` desde cero. El gateway ya no carga nada de su sesión interna porque no le damos un `previous_response_id` que la trigger-ee.
+
+### Costo
+
+Cada iteración crece linealmente con tool_calls. Para un tool loop normal (1–3 iteraciones) son ~unos KB extra por request. Aceptable.
+
+### Beneficio
+
+- **Cero wrapper "[Chat messages since your last reply - for context]"** que confundía al modelo.
+- **Cero contaminación de sesión server-side** dentro del turn.
+- **Compatibilidad total** con el patrón non-streaming de OpenAI Responses estándar.
+- Si una iteración emite garbage, no contamina la siguiente — porque la siguiente arranca con `input_items` que vos construiste, no con contexto server-side opaco.
+
+### El stack de fixes hasta acá (síntomas + raíces)
+
+| Versión | Capa | Qué arregló |
+|---|---|---|
+| v2.1.3 | filtro de output | dropea NO_REPLY/tokens triviales |
+| v2.1.4 | guard del chain_store + instructions every turn | no propagaba "modelo se rindió", reforzaba behavior |
+| v2.1.5 | chat_log register | HA realmente renderizaba el speech (era un missing call) |
+| v2.1.6 | **chain cross-turn eliminado** | sin contaminación de turn-a-turn |
+| **v2.1.7** | **chain in-loop eliminado** | sin wrapper de gateway, sin contaminación intra-turn |
+
+v2.1.3–v2.1.5 quedan como defensa-en-profundidad (todavía útiles, no se sacan). v2.1.6–v2.1.7 son los fixes estructurales que **eliminan la fuente** del problema.
+
+### Plan v2.2.0
+
+Sigue siendo: mirror del patrón `openai_conversation` del core (streaming SSE + `async_get_result_from_chat_log`). Pero con v2.1.7 el behavior funcional debería estar OK — v2.2.0 es más una refactor para alinearse al patrón canónico y agregar streaming.
+
+---
+
 ## [2.1.6] · 2026-05-11 — Turnos stateless desde el gateway (anti chain-contamination)
 
 ### Smoking gun
