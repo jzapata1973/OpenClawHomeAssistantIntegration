@@ -4,6 +4,59 @@
 
 ---
 
+## [2.1.5] · 2026-05-11 — Registrar assistant content en `chat_log` (causa raíz real del "No response from OpenClaw")
+
+### Diagnóstico (crédito al sub-agente externo)
+
+> En modern HA `ConversationEntity` con `chat_log.async_provide_llm_data()`, HA mira `chat_log.content` para renderizar la respuesta, **NO solo** `intent_response.speech`. v2.1.3 (y v2.1.4) nunca llaman `chat_log.async_add_assistant_content_without_tools(...)` → para HA, el chat_log queda "sin respuesta del asistente" → muestra "No response from OpenClaw" aunque el speech esté seteado.
+
+Esto explica el patrón observado en la última prueba:
+
+- Turn 1 "prende las luces" → tool_call(HassTurnOn) → HA al ejecutar la tool puebla items en `chat_log` automáticamente → render OK ✅
+- Turn 2 "apaga las luces" → tool_call(HassTurnOff) o pregunta de clarificación → algún path que termina poblando chat_log → render OK ✅
+- Turn 3 "las de mi pieza" → modelo emite solo `NO_REPLY` (filtrado por v2.1.3 a `"Listo."`), NO tool_calls → **chat_log assistant-side vacío** → "No response from OpenClaw" ❌
+
+### Fix (1 línea + try/except defensivo)
+
+`conversation.py`, después de calcular `final_text` y antes de armar `IntentResponse`:
+
+```python
+try:
+    chat_log.async_add_assistant_content_without_tools(
+        conversation.AssistantContent(
+            agent_id=self.entity_id,
+            content=final_text,
+        )
+    )
+except Exception as err:
+    _LOGGER.debug("Could not push to chat_log (non-fatal): %s", err)
+```
+
+- **`*_without_tools`** porque las tool calls del turno ya las ejecutó HA dentro del loop (vía `chat_log.llm_api.async_call_tool`) y quedaron registradas en `chat_log` por HA. Solo falta el texto final del asistente.
+- **try/except defensivo**: por si en alguna versión vieja de HA no existe ese método, no rompemos el turno — caemos al path viejo de `intent_response.speech`.
+
+### Relación con fixes anteriores
+
+- Los filtros de v2.1.3 (`NO_REPLY` y compañía) **siguen siendo útiles** — sin ellos pasaría texto basura al chat_log.
+- El Fix B de v2.1.4 (chain guard contra `"Listo."`) **sigue siendo útil** — evita propagar el patrón del modelo derivando.
+- El Fix A de v2.1.4 (instructions every turn) **sigue siendo útil** — re-anchora el comportamiento del modelo.
+- Pero todo eso solo arreglaba SÍNTOMAS. v2.1.5 ataca la **causa raíz** del render error.
+
+### Lo que viene en v2.2.0
+
+Refactor más profundo siguiendo exactamente el patrón de `openai_conversation` del core:
+
+```python
+async def _async_handle_message(self, user_input, chat_log):
+    await chat_log.async_provide_llm_data(...)
+    await self._async_handle_chat_log(chat_log)  # toda la lógica de streaming + tool loop
+    return conversation.async_get_result_from_chat_log(user_input, chat_log)
+```
+
+Es decir, construir la `ConversationResult` desde el `chat_log` directamente (en vez de armar nuestra `IntentResponse` separada). Eso, combinado con streaming SSE real, debería hacer que la mayoría de los workarounds de v2.1.x se vuelvan defensa-en-profundidad.
+
+---
+
 ## [2.1.4] · 2026-05-11 — Re-anchor instructions + chain guard contra estados "modelo se rindió"
 
 Dos micro-fixes defensivos sugeridos por un sub-agente externo después de ver que v2.1.3, aún filtrando `NO_REPLY` bien, igual podía caer en el patrón "modelo emite solo trivial / fallback se repite turn-a-turn".

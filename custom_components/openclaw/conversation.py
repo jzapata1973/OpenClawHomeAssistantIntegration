@@ -400,6 +400,38 @@ class OpenClawConversationEntity(
 
         self._coordinator.update_last_activity()
 
+        # v2.1.5: register the assistant content with the chat_log.
+        #
+        # In modern ConversationEntity, HA uses chat_log.content to
+        # render the assistant's reply in the UI, not just the speech
+        # attached to the IntentResponse. When a turn included
+        # function_calls, HA's call to chat_log.llm_api.async_call_tool
+        # internally pushes tool items into chat_log, which seems to
+        # also cause our text to be picked up — that's why turns WITH
+        # tools rendered OK. But on a pure-text turn (no tool_calls, or
+        # all output filtered down to the trivial fallback), chat_log
+        # had no assistant entry → HA rendered "No response from
+        # OpenClaw" even though intent_response.speech was set.
+        #
+        # The fix is to explicitly attach the assistant content to the
+        # chat_log before returning. We use the *_without_tools variant
+        # because by this point all tool calls of the turn have already
+        # been executed and their results recorded by HA inside the
+        # loop; only the final assistant text is missing.
+        try:
+            chat_log.async_add_assistant_content_without_tools(
+                conversation.AssistantContent(
+                    agent_id=self.entity_id,
+                    content=final_text,
+                )
+            )
+        except Exception as err:  # noqa: BLE001 — best-effort, never break the turn
+            _LOGGER.debug(
+                "Could not push assistant content into chat_log "
+                "(non-fatal, falling back to intent_response.speech): %s",
+                err,
+            )
+
         intent_response = intent.IntentResponse(language=user_input.language)
         intent_response.async_set_speech(final_text)
         return conversation.ConversationResult(
