@@ -214,12 +214,15 @@ class OpenClawConversationEntity(
             {"type": "message", "role": "user", "content": user_input.text}
         ]
 
-        # The gateway carries the chain server-side. ``instructions`` is
-        # only honored on the very first turn of a chain — sending it
-        # again with previous_response_id is a no-op (and uses tokens).
-        send_instructions: str | None = (
-            instructions if previous_response_id is None else None
-        )
+        # v2.1.4: always send `instructions` on the FIRST iteration of
+        # each user turn, even when previous_response_id is set. The
+        # gateway technically carries them server-side after the first
+        # turn of a chain, but Qwen3 sometimes drifts (e.g. starts
+        # emitting raw NO_REPLY) when the original instructions get
+        # diluted by intermediate tool_call_output items in the chain.
+        # Re-asserting them once per user turn re-anchors the behavior
+        # for the cost of ~300 extra chars (cheap).
+        send_instructions: str | None = instructions
 
         # v2.1.2: accumulate text across ALL iterations rather than only
         # taking the last one. Qwen3.6 sometimes emits its useful summary
@@ -374,9 +377,25 @@ class OpenClawConversationEntity(
 
         # Persist the chain head AFTER the loop converges, so we don't
         # advance into a partial state if the loop errored mid-way.
-        if final_response_id:
+        #
+        # v2.1.4: also DON'T advance the chain when the final output was
+        # filtered down to the "Listo." fallback (which means the model
+        # only emitted trivial / NO_REPLY tokens). If we advance into a
+        # turn whose chain state is "the model gave up", the next user
+        # turn inherits that pattern and tends to keep emitting trivial
+        # responses. Staying on the previous good response_id breaks the
+        # loop and the next turn starts from a healthier state.
+        chain_is_clean = final_text != "Listo."
+        if final_response_id and chain_is_clean:
             await self._chain_store.async_set_last(
                 session_key, final_response_id
+            )
+        elif final_response_id:
+            _LOGGER.debug(
+                "Dropping response_id %s; final output collapsed to the "
+                "trivial-fallback. session_key=%s",
+                final_response_id,
+                session_key,
             )
 
         self._coordinator.update_last_activity()
