@@ -226,11 +226,42 @@ class OpenClawConversationEntity(
         configured = self._opt(CONF_AGENT_ID, DEFAULT_AGENT_ID)
         return (voice_agent or configured or DEFAULT_AGENT_ID).strip()
 
-    def _resolve_session_key(self, agent_name: str) -> str:
+    def _resolve_session_key(
+        self,
+        agent_name: str,
+        user_input: conversation.ConversationInput | None = None,
+    ) -> str:
+        """Pick the OpenResponses ``user`` field for this turn.
+
+        v2.1.8: hypothesis (sub-agent diagnosis) is that the OpenClaw
+        gateway uses the ``user`` field as a server-side session key —
+        loading prior context for the same string and accumulating into
+        it. Keeping ``user`` constant across Assist conversations
+        therefore re-introduces the chain-contamination we already
+        eliminated on the HA side in v2.1.6/v2.1.7.
+
+        Fix: rotate ``user`` by HA's ``conversation_id`` so each
+        distinct Assist conversation maps to a fresh server-side
+        session, while turns *within* a single conversation still share
+        one bucket. The configured "Assist Session ID override" still
+        acts as the prefix (so the user can recognise their bucket
+        family in OpenClaw web), with the conversation_id suffix giving
+        per-conversation isolation.
+        """
         configured = self._opt(CONF_ASSIST_SESSION_ID, DEFAULT_ASSIST_SESSION_ID)
-        if isinstance(configured, str) and configured.strip():
-            return configured.strip()
-        return f"openclaw-{self.entry.entry_id[:8]}-{agent_name}"
+        base = (
+            configured.strip()
+            if isinstance(configured, str) and configured.strip()
+            else f"openclaw-{self.entry.entry_id[:8]}-{agent_name}"
+        )
+        conv_id = (
+            (getattr(user_input, "conversation_id", None) or "").strip()
+            if user_input
+            else ""
+        )
+        if not conv_id:
+            return base
+        return f"{base}:{conv_id[:24]}"
 
     def _build_instructions(self) -> str:
         location = self.hass.config.location_name or "Home"
@@ -256,7 +287,7 @@ class OpenClawConversationEntity(
     ) -> conversation.ConversationResult:
         """Handle one user turn — possibly with several tool-call iterations."""
         agent_name = self._resolve_agent_name()
-        session_key = self._resolve_session_key(agent_name)
+        session_key = self._resolve_session_key(agent_name, user_input)
         instructions = self._build_instructions()
 
         # Load HA's Assist API. After this, chat_log.llm_api.tools holds the
@@ -308,6 +339,21 @@ class OpenClawConversationEntity(
         final_response_id: str | None = None
 
         for iteration in range(MAX_TOOL_ITERATIONS):
+            if iteration == 0:
+                # v2.1.8: visibility without enabling debug logs. Helps
+                # tell at a glance whether the gateway is being asked
+                # what we think we're asking, and whether `user`
+                # actually rotates per Assist conversation (Bug B fix).
+                _LOGGER.warning(
+                    "OpenClaw v2.1.8 → POST /v1/responses | "
+                    "model=openclaw/%s | user=%r | input_items=%d | "
+                    "tools=%d | instructions_len=%d",
+                    agent_name,
+                    session_key,
+                    len(input_items),
+                    len(tools) if tools else 0,
+                    len(instructions) if instructions else 0,
+                )
             try:
                 response = await self._client.async_send_responses(
                     model=f"openclaw/{agent_name}",
@@ -360,14 +406,33 @@ class OpenClawConversationEntity(
                         }
                     )
                 elif item_type == "message":
+                    # v2.1.8 Fix A: convert the output-side message item
+                    # into a valid INPUT-side message item before
+                    # appending to input_items for the next iteration.
+                    #
+                    # In the OpenAI Responses schema, output messages
+                    # carry content as a list of {type:"output_text",
+                    # text:"..."} pieces, but input messages expect
+                    # content as a string (or a list of `input_text`
+                    # pieces). Re-shipping the raw output item produces
+                    # a request the gateway rejects/misinterprets — in
+                    # multi-iteration tool loops that derails the chain
+                    # silently.
+                    collected: list[str] = []
                     for piece in item.get("content", []) or []:
                         if piece.get("type") == "output_text":
                             txt = piece.get("text") or ""
                             if txt:
-                                text_pieces.append(txt)
-                    # Also keep the assistant message in the running
-                    # conversation so the next iteration sees it.
-                    input_items.append(item)
+                                collected.append(txt)
+                    if collected:
+                        text_pieces.extend(collected)
+                        input_items.append(
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": "\n".join(collected),
+                            }
+                        )
 
             if text_pieces:
                 all_text_pieces.extend(text_pieces)
