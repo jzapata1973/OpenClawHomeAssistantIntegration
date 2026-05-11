@@ -12,6 +12,7 @@ import aiohttp
 from .const import (
     API_CHAT_COMPLETIONS,
     API_MODELS,
+    API_RESPONSES,
     API_TOOLS_INVOKE,
 )
 
@@ -514,6 +515,96 @@ class OpenClawApiClient:
             raise OpenClawConnectionError(
                 f"Cannot connect to OpenClaw gateway: {err}"
             ) from err
+
+    # ─── OpenResponses native API (v2.0.0) ────────────────────────────
+    #
+    # /v1/responses is OpenClaw's native response API. Unlike
+    # /v1/chat/completions, it honors the requested `model` even when a
+    # session reference is present, which lets us pin a stable
+    # `user`/session_key without losing routing to the configured agent.
+    # Use this for the conversation agent. The chat-completions methods
+    # above remain for legacy callers (e.g. the non-conversation service
+    # handler) until those are migrated too.
+
+    async def async_send_responses(
+        self,
+        *,
+        model: str,
+        input_text: str,
+        user: str,
+        previous_response_id: str | None = None,
+        instructions: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /v1/responses and return the parsed JSON response."""
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": input_text,
+            "user": user,
+            "stream": False,
+        }
+        if previous_response_id:
+            payload["previous_response_id"] = previous_response_id
+        if instructions:
+            payload["instructions"] = instructions
+
+        headers = {
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type": "application/json",
+        }
+
+        session = await self._get_session()
+        url = f"{self._base_url}{API_RESPONSES}"
+
+        try:
+            async with session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=STREAM_TIMEOUT,
+                ssl=self._ssl_param,
+            ) as resp:
+                body = await resp.text()
+                if resp.status in (401, 403):
+                    raise OpenClawAuthError(
+                        f"Auth failed on /v1/responses ({resp.status})"
+                    )
+                if resp.status >= 400:
+                    raise OpenClawApiError(
+                        f"OpenResponses HTTP {resp.status}: {body[:500]}"
+                    )
+                content_type = resp.content_type or ""
+                if "json" not in content_type:
+                    raise OpenClawApiError(
+                        f"Unexpected content-type {content_type!r} from "
+                        f"{url} (likely /v1/responses is disabled in the "
+                        f"gateway). Body: {body[:200]}"
+                    )
+                return json.loads(body)
+        except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, asyncio.TimeoutError) as err:
+            raise OpenClawConnectionError(
+                f"Cannot reach OpenClaw gateway at {url}: {err}"
+            ) from err
+
+    @staticmethod
+    def extract_responses_text(response: dict[str, Any]) -> str:
+        """Pull the assistant text out of an OpenResponses payload.
+
+        Shape::
+
+            { "output": [
+                { "type": "message",
+                  "content": [ { "type": "output_text", "text": "..." } ] }
+              ] }
+        """
+        for item in response.get("output", []) or []:
+            if item.get("type") != "message":
+                continue
+            for piece in item.get("content", []) or []:
+                if piece.get("type") == "output_text":
+                    text = piece.get("text")
+                    if text:
+                        return text
+        return ""
 
     async def async_close(self) -> None:
         """Close the HTTP session."""

@@ -149,4 +149,5 @@ ATTR_DURATION_MS = "duration_ms"
 # home page (text/html) for any unrecognised route.
 API_MODELS = "/v1/models"
 API_CHAT_COMPLETIONS = "/v1/chat/completions"
+API_RESPONSES = "/v1/responses"
 API_TOOLS_INVOKE = "/tools/invoke"
