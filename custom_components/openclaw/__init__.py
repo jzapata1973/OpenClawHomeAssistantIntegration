@@ -87,6 +87,7 @@ from .const import (
     SERVICE_INVOKE_TOOL,
     SERVICE_SEND_MESSAGE,
 )
+from .chain_store import ChainStore
 from .coordinator import OpenClawCoordinator
 from .exposure import apply_context_policy, build_exposed_entities_context
 from .helpers import extract_text_recursive
@@ -166,6 +167,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: OpenClawConfigEntry) -> 
 
     coordinator = OpenClawCoordinator(hass, client)
 
+    # v2.0.0: persistent chain head per session_key for the OpenResponses
+    # native conversation agent. Loaded once at entry setup; per-entry
+    # writes happen from conversation.py.
+    chain_store = ChainStore(hass)
+    await chain_store.async_load()
+
     # Store the addon config path for token re-reads
     addon_config_path = entry.data.get(CONF_ADDON_CONFIG_PATH)
 
@@ -173,6 +180,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: OpenClawConfigEntry) -> 
     hass.data[DOMAIN][entry.entry_id] = {
         "client": client,
         "coordinator": coordinator,
+        "chain_store": chain_store,
         "addon_config_path": addon_config_path,
         "entry": entry,
         "entry_id": entry.entry_id,
