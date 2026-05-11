@@ -26,6 +26,7 @@ CONF_ADDON_CONFIG_PATH = "addon_config_path"
 CONF_AGENT_ID = "agent_id"
 CONF_VOICE_AGENT_ID = "voice_agent_id"
 CONF_ASSIST_SESSION_ID = "assist_session_id"
+CONF_USER_SCOPE = "user_scope"
 
 # Options
 CONF_INCLUDE_EXPOSED_CONTEXT = "include_exposed_context"
@@ -42,6 +43,18 @@ CONF_THINKING_TIMEOUT = "thinking_timeout"
 DEFAULT_AGENT_ID = "main"
 DEFAULT_VOICE_AGENT_ID = ""
 DEFAULT_ASSIST_SESSION_ID = ""
+
+# v2.1.9: how the OpenResponses `user` field is built.
+#   "conversation": user = "<base>:<conversation_id[:24]>"
+#       Each Assist conversation gets a fresh gateway-side session.
+#       No cross-conversation memory in OpenClaw's built-in store.
+#   "stable": user = "<base>"
+#       One persistent gateway-side session; memory persists across
+#       Assist conversations. More prone to chain contamination.
+USER_SCOPE_CONVERSATION = "conversation"
+USER_SCOPE_STABLE = "stable"
+DEFAULT_USER_SCOPE = USER_SCOPE_CONVERSATION
+USER_SCOPE_OPTIONS = (USER_SCOPE_CONVERSATION, USER_SCOPE_STABLE)
 DEFAULT_INCLUDE_EXPOSED_CONTEXT = True
 DEFAULT_CONTEXT_MAX_CHARS = 13000
 DEFAULT_CONTEXT_STRATEGY = "truncate"

@@ -55,11 +55,14 @@ from .const import (
     CONF_AGENT_ID,
     CONF_ASSIST_SESSION_ID,
     CONF_INCLUDE_EXPOSED_CONTEXT,
+    CONF_USER_SCOPE,
     CONF_VOICE_AGENT_ID,
     DEFAULT_AGENT_ID,
     DEFAULT_ASSIST_SESSION_ID,
     DEFAULT_INCLUDE_EXPOSED_CONTEXT,
+    DEFAULT_USER_SCOPE,
     DOMAIN,
+    USER_SCOPE_CONVERSATION,
 )
 from .coordinator import OpenClawCoordinator
 
@@ -75,6 +78,28 @@ MAX_TOOL_ITERATIONS = 8
 # Capping protects against worst-case payload bloat while keeping enough
 # context for sensible follow-up handling.
 MAX_HISTORY_ITEMS = 40
+
+# v2.1.9: substrings that HA's pipeline injects into chat_log when its
+# own internal timeout fires before our integration returns. If we ship
+# these back to the gateway as "prior assistant content", the model
+# learns to apologise for non-existent failures and may emit them
+# verbatim in future turns. Drop them defensively at conversion time.
+_HA_INJECTED_NOISE_SUBSTRINGS = (
+    "No response from OpenClaw",
+    "No response from",  # also generic variants HA might add
+)
+
+
+def _looks_like_ha_injected_noise(text: str) -> bool:
+    """Return True if ``text`` is (or contains only) HA's stock 'no response' messages."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return True
+    lowered = cleaned.lower()
+    for needle in _HA_INJECTED_NOISE_SUBSTRINGS:
+        if needle.lower() in lowered:
+            return True
+    return False
 
 
 def _convert_chat_log_to_input_items(
@@ -102,7 +127,12 @@ def _convert_chat_log_to_input_items(
                 )
         elif isinstance(entry, conversation.AssistantContent):
             text = (getattr(entry, "content", None) or "").strip()
-            if text:
+            # v2.1.9: skip HA-injected "No response from OpenClaw" noise
+            # so it never reaches the model as if it were our own prior
+            # reply. Without this, the model "learns" to apologise for
+            # nonexistent failures and may emit the same text verbatim
+            # in future turns.
+            if text and not _looks_like_ha_injected_noise(text):
                 items.append(
                     {"type": "message", "role": "assistant", "content": text}
                 )
@@ -254,6 +284,12 @@ class OpenClawConversationEntity(
             if isinstance(configured, str) and configured.strip()
             else f"openclaw-{self.entry.entry_id[:8]}-{agent_name}"
         )
+        # v2.1.9: user_scope option chooses behavior:
+        #   "conversation" → rotate by conversation_id (isolation, default)
+        #   "stable"       → keep base only (cross-conversation memory)
+        scope = self._opt(CONF_USER_SCOPE, DEFAULT_USER_SCOPE)
+        if scope != USER_SCOPE_CONVERSATION:
+            return base
         conv_id = (
             (getattr(user_input, "conversation_id", None) or "").strip()
             if user_input
