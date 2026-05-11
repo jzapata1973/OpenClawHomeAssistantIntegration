@@ -1,5 +1,91 @@
 # Changelog local · fork casajaz
 
+> **Dos integraciones conviven en este repo:**
+> - `custom_components/openclaw/` — fork del integration original de techartdev (basado en `/v1/chat/completions`). Versionado `1.x.x` propio del fork. Las entries de abajo bajo "## [1.x.x]" son de esta integración.
+> - `custom_components/openclaw_agent/` — integración **nueva** desde cero usando el endpoint nativo `/v1/responses`. Versionado `0.x.x` propio. Las entries bajo "## [openclaw_agent vX.Y.Z]" son de esta otra.
+>
+> El día que `openclaw_agent` esté en producción estable, archivamos el folder `openclaw/`.
+
+---
+
+## [openclaw_agent v0.1.0] · 2026-05-10 — primera versión nativa
+
+Nueva integración HA construida desde cero sobre el endpoint nativo `/v1/responses` de OpenClaw. **Esta es la respuesta arquitectónica al combo de bugs que motivaron v1.0.0–v1.0.3 del fork de openclaw**.
+
+### Por qué existe (resumen ejecutivo)
+
+El endpoint `/v1/chat/completions` (OpenAI compatible) tiene un combo de bugs que hace imposible un routing estable agente+sesión desde el cliente:
+
+- Cualquier `session_id` en payload, o `X-Session-Id`/`x-openclaw-session-key` en headers, **fuerza routing al agente default del gateway** ignorando el `model` pedido. Verificado empíricamente con 3 curl tests controlados el 2026-05-10.
+- El gateway responde con `"model": "<el pedido>"` aunque internamente usó otro agente. La response miente.
+
+`/v1/responses` no tiene ninguno de esos bugs. Con `user` estable + `previous_response_id` se obtiene routing real al agente + continuidad real de sesión + memoria persistente del propio gateway.
+
+### Arquitectura
+
+```
+HA Assist
+  ↓
+custom_components/openclaw_agent/conversation.py
+  ↓ POST /v1/responses
+  {
+    model:               "openclaw/nabu-home",
+    input:               <user message>,
+    user:                "casajaz-nabuhome",        // session_key estable
+    previous_response_id: <last seen response.id>,  // chain
+    instructions:         <only on first turn>
+  }
+  ↓
+OpenClaw 192.168.10.40:18789
+  → routes to nabu-home (vllm/qwen3.6-27b-autoround)
+  → chains via previous_response_id
+  → built-in memory persists facts about the user
+```
+
+### Pre-requisito de servidor
+
+`/v1/responses` está deshabilitado por default. Hay que habilitarlo en `~/.openclaw/openclaw.json`:
+
+```json
+"gateway": {
+  "http": {
+    "endpoints": {
+      "responses": { "enabled": true }
+    }
+  }
+}
+```
+
+(Ya habilitado en producción del usuario el 2026-05-10.)
+
+### Files
+
+- `__init__.py` — entry point + setup del client + chain store
+- `manifest.json` — `domain: openclaw_agent`, version 0.1.0
+- `const.py` — keys + defaults (`DEFAULT_SESSION_KEY = "casajaz-nabuhome"`, `DEFAULT_AGENT_NAME = "nabu-home"`)
+- `client.py` — POST /v1/responses + extracción de texto del response
+- `chain_store.py` — persistencia del último `response.id` por `session_key` a disco (`config/.storage/openclaw_agent.chain`) — sobrevive restart de HA
+- `conversation.py` — agent `AbstractConversationAgent` que arma payload, llama client, mantiene chain
+- `config_flow.py` — UI inicial (URL, token, agente, session_key) + options flow + probe de conectividad
+- `strings.json` + `translations/{en,es}.json` — UI strings
+- `README.md` — doc de usuario para esta integración
+
+### Limitaciones conocidas v0.1.0
+
+- **No streaming** — la response llega completa. Para Qwen local puede demorar unos segundos. Streaming SSE nativo en v0.2.0.
+- **No tool injection desde HA** — el agente usa las skills/MCP que ya tiene configuradas en OpenClaw. El acceso a HA se hace vía el server MCP de Home Assistant que ya está en el `openclaw-mcp-adapter`.
+- **System instructions solo en primer turn de la chain** — para refrescar (ej. nuevas entidades expuestas), borrar el archivo `.storage/openclaw_agent.chain` o borrar la entrada del session_key específico.
+
+### Para futuras versiones
+
+- v0.2.0: streaming SSE
+- v0.3.0: refresh periódico de instrucciones (cada N turnos o on-demand vía service)
+- v0.4.0: usar entidades expuestas como instructions iniciales (paridad con `openclaw` v1.x include_exposed_entities_context)
+
+---
+
+
+
 Cambios aplicados sobre el fork `jzapata1973/OpenClawHomeAssistantIntegration` que NO están (todavía) en el upstream `techartdev`. Este archivo es independiente del `CHANGELOG.md` del upstream para evitar conflictos de merge.
 
 **Versionado:** semver propio del fork, partiendo en `1.0.0`. Patch = bug fix, minor = feature, major = cambio incompatible.
