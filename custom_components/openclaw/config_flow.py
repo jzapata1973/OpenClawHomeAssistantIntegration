@@ -41,6 +41,7 @@ from .const import (
     CONF_GATEWAY_HOST,
     CONF_GATEWAY_PORT,
     CONF_GATEWAY_TOKEN,
+    CONF_USER_SCOPE,
     CONF_USE_SSL,
     CONF_VERIFY_SSL,
     CONF_CONTEXT_MAX_CHARS,
@@ -61,6 +62,7 @@ from .const import (
     DEFAULT_ASSIST_SESSION_ID,
     DEFAULT_GATEWAY_HOST,
     DEFAULT_GATEWAY_PORT,
+    DEFAULT_USER_SCOPE,
     DEFAULT_CONTEXT_MAX_CHARS,
     DEFAULT_CONTEXT_STRATEGY,
     DEFAULT_ENABLE_TOOL_CALLS,
@@ -74,6 +76,7 @@ from .const import (
     DEFAULT_VOICE_AGENT_ID,
     DOMAIN,
     OPENCLAW_CONFIG_REL_PATH,
+    USER_SCOPE_OPTIONS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -484,6 +487,10 @@ class OpenClawOptionsFlow(OptionsFlowWithReload):
                     DEFAULT_ASSIST_SESSION_ID,
                 ),
             ): str,
+            vol.Optional(
+                CONF_USER_SCOPE,
+                default=options.get(CONF_USER_SCOPE, DEFAULT_USER_SCOPE),
+            ): vol.In(list(USER_SCOPE_OPTIONS)),
             vol.Optional(
                 CONF_INCLUDE_EXPOSED_CONTEXT,
                 default=options.get(

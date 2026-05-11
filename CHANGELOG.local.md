@@ -4,6 +4,84 @@
 
 ---
 
+## [2.1.9] · 2026-05-11 — `user_scope` configurable + filtro defensivo contra "No response from OpenClaw" reciclado
+
+### Estado tras v2.1.8 (verificado en producción)
+
+- ✅ Sesión rotada por `user` field → confirmado (sub-agente y usuario)
+- ✅ Tool calls (HassTurnOn/HassTurnOff) ejecutan físicamente
+- ✅ Prender/apagar luces funciona
+- ⚠️ Queda residuo: "No response from OpenClaw" aparece como segunda línea pegada a la respuesta correcta. Análisis: el pipeline de Assist tiene su propio timeout (~30-60s); cuando nuestra integración tarda cerca del límite, HA inyecta su mensaje "No response from OpenClaw" como AssistantContent al chat_log preventivamente. Cuando nuestra respuesta real llega después con el texto bueno, ambos quedan registrados en el chat_log. La UI los muestra como una sola burbuja con dos líneas, y en el próximo user turn nuestro `_convert_chat_log_to_input_items` los manda al gateway como parte del contexto histórico — el modelo aprende a apologizar por fallas inexistentes.
+
+### Conflicto entre sub-agentes (resolución)
+
+Dos sub-agentes externos diagnosticaron caminos opuestos:
+- **Sub-agente #1** (el que diagnosticó v2.1.8): "rotar `user` por conversation_id, gateway lo usa como session key". Empíricamente comprobado al fixear el NO_REPLY.
+- **Sub-agente #2** (post-v2.1.8 sobre código v2.1.7 desactualizado): "NO rotar, causa fragmentación de sesiones". La "fragmentación" que vio eran sesiones históricas de versiones pre-v2.1.8 con `user` estable, no inconsistencia actual.
+
+La pelea desaparece dejando al usuario elegir.
+
+### Fix A — `user_scope` configurable
+
+Nueva opción en `OptionsFlow`:
+
+```
+user_scope:
+  conversation  ← default (lo que v2.1.8 hace)
+  stable
+```
+
+- `conversation` → `user = f"{base}:{conversation_id[:24]}"`. Cada Assist conversation = sesión gateway-side fresca. Sin contaminación cross-conversation, pero sin memoria persistente entre conversations.
+- `stable` → `user = base`. Una sola sesión gateway-side persistente. Memoria built-in de OpenClaw retiene facts del usuario entre conversations. Vulnerable a contaminación a largo plazo.
+
+Default a `conversation` porque es lo que probamos andando en v2.1.8. Para usuarios que valoran memoria persistente, cambian la option en Settings → Devices → OpenClaw → Configure.
+
+Constantes: `CONF_USER_SCOPE`, `DEFAULT_USER_SCOPE = USER_SCOPE_CONVERSATION`, `USER_SCOPE_OPTIONS = ("conversation", "stable")`.
+
+### Fix B — Filtro defensivo en `_convert_chat_log_to_input_items`
+
+Cuando convertimos `chat_log.content` a `input_items` para enviar al gateway, ahora **dropeamos** cualquier `AssistantContent` cuyo texto contenga literal "No response from OpenClaw" (case-insensitive). Helper:
+
+```python
+def _looks_like_ha_injected_noise(text: str) -> bool:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return True
+    lowered = cleaned.lower()
+    for needle in _HA_INJECTED_NOISE_SUBSTRINGS:
+        if needle.lower() in lowered:
+            return True
+    return False
+```
+
+Substrings filtradas: `"No response from OpenClaw"`, `"No response from"` (variante genérica).
+
+Resultado:
+- HA Assist UI sigue mostrando "No response from OpenClaw" como segunda línea (eso es internal de HA, no podemos suprimirlo desde la integración)
+- PERO el chat_log que el gateway recibe en el próximo turn YA no incluye esa noise → el modelo no la aprende ni la replica.
+
+### Lo que NO resuelve esto
+
+El "No response from OpenClaw" sigue apareciendo visualmente en la UI. La causa real es el timeout del pipeline de Assist HA. La solución estructural es v2.2.0 con streaming SSE — cuando HA recibe deltas progresivos, su timeout se resetea automáticamente y nunca dispara el mensaje preventivo.
+
+### Plan v2.2.0
+
+Mirror del patrón `openai_conversation` del core de HA:
+
+```python
+await chat_log.async_provide_llm_data(...)
+async for delta in self._client.async_stream_responses(...):
+    await chat_log.async_add_delta_content_stream(delta)
+return conversation.async_get_result_from_chat_log(user_input, chat_log)
+```
+
+Más cambios:
+- `client.py`: nuevo método `async_stream_responses()` que parsea SSE
+- `conversation.py`: refactor del loop a streaming
+- Posiblemente eliminar las heurísticas defensivas de v2.1.3–v2.1.9 que se vuelven innecesarias
+
+---
+
 ## [2.1.8] · 2026-05-11 — Schema fix de message replay + rotación de `user` por `conversation_id` + WARN visibility
 
 ### Bugs encontrados por code-review del sub-agente externo (sobre v2.1.7)
