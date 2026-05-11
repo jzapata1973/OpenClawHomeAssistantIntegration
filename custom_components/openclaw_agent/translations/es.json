@@ -1,0 +1,38 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "OpenClaw Agent (nativo)",
+        "description": "Integración nativa vía /v1/responses con session_key estable y chain persistente. Evita los bugs de routing/sesión del endpoint OpenAI-compatible.",
+        "data": {
+          "gateway_url": "URL del Gateway (ej: http://192.168.10.40:18789)",
+          "gateway_token": "Token del Gateway",
+          "agent_name": "Nombre del agente OpenClaw",
+          "session_key": "Session key estable (se manda como `user`; configurás una vez y listo)",
+          "include_instructions": "Enviar instrucciones por defecto en el primer turno"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "No se puede alcanzar el gateway. Revisá URL y red.",
+      "invalid_auth": "El token fue rechazado (401/403). Regeneralo en OpenClaw y reintentá.",
+      "responses_disabled": "El gateway devolvió 404 o HTML para /v1/responses. Habilitalo en openclaw.json: gateway.http.endpoints.responses.enabled = true, reiniciá OpenClaw y reintentá."
+    },
+    "abort": {
+      "already_configured": "Este gateway + session key ya está configurado."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Opciones de OpenClaw Agent",
+        "data": {
+          "agent_name": "Nombre del agente OpenClaw",
+          "session_key": "Session key estable",
+          "include_instructions": "Enviar instrucciones por defecto en el primer turno",
+          "extra_instructions": "Instrucciones extra que se añaden al default (opcional)"
+        }
+      }
+    }
+  }
+}
